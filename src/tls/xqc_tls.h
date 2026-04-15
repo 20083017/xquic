@@ -8,6 +8,11 @@
 #include <xquic/xquic_typedef.h>
 #include <openssl/err.h>
 
+/* QUIC-TLS compat shim for stock OpenSSL 3.0 (no-op if quictls/BoringSSL) */
+#if defined(XQC_SSL_TYPE_OPENSSL)
+#include "src/tls/openssl/xqc_ossl_quic_compat.h"
+#endif
+
 #include "src/tls/xqc_tls_defs.h"
 #include "src/transport/xqc_packet.h"
 

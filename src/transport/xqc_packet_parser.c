@@ -7,6 +7,12 @@
 #include <openssl/x509.h>
 #endif
 #include <openssl/hmac.h>
+#include <openssl/opensslv.h>
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+#include <openssl/evp.h>
+#include <openssl/core_names.h>
+#include <openssl/params.h>
+#endif
 #include "src/transport/xqc_packet_parser.h"
 #include "src/transport/xqc_cid.h"
 #include "src/common/utils/vint/xqc_variable_len_int.h"
@@ -1396,18 +1402,34 @@ xqc_gen_reset_token(xqc_cid_t *cid, unsigned char *token, int token_len, char *k
     unsigned char *input = cid->cid_buf;
     int input_len = cid->cid_len;
     unsigned char output[EVP_MAX_MD_SIZE];
-    int output_len = EVP_MAX_MD_SIZE;
-    const EVP_MD *engine = NULL;
-    engine = EVP_md5();
+    unsigned int output_len = EVP_MAX_MD_SIZE;
+
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L && !defined(OPENSSL_IS_BORINGSSL)
+    /* OpenSSL 3.0: use EVP_MAC API (HMAC_CTX is deprecated) */
+    EVP_MAC *mac = EVP_MAC_fetch(NULL, "HMAC", NULL);
+    EVP_MAC_CTX *ctx = EVP_MAC_CTX_new(mac);
+    OSSL_PARAM params[2];
+    params[0] = OSSL_PARAM_construct_utf8_string(OSSL_MAC_PARAM_DIGEST, "MD5", 0);
+    params[1] = OSSL_PARAM_construct_end();
+    EVP_MAC_init(ctx, (const unsigned char *)key, keylen, params);
+    EVP_MAC_update(ctx, input, input_len);
+    size_t mac_len = 0;
+    EVP_MAC_final(ctx, output, &mac_len, sizeof(output));
+    output_len = (unsigned int)mac_len;
+    EVP_MAC_CTX_free(ctx);
+    EVP_MAC_free(mac);
+#else
+    /* BoringSSL / BabaSSL / older OpenSSL: legacy HMAC API */
+    const EVP_MD *engine = EVP_md5();
     HMAC_CTX *ctx = HMAC_CTX_new();
     HMAC_CTX_reset(ctx);
     HMAC_Init_ex(ctx, key, keylen, engine, NULL);
     HMAC_Update(ctx, input, input_len);
-
     HMAC_Final(ctx, output, &output_len);
     HMAC_CTX_free(ctx);
+#endif
 
-    memcpy(token, output, output_len < token_len ? output_len : token_len);
+    memcpy(token, output, output_len < (unsigned int)token_len ? output_len : (unsigned int)token_len);
 }
 
 /*

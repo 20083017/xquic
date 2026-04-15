@@ -5,7 +5,7 @@ project (xquic)
 
 set (xquic_VERSION_MAJOR 0)
 set (xquic_VERSION_MINOR 1)
-set(SSL_TYPE "boringssl")
+set(SSL_TYPE "openssl")
 set (CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 
 option (XQC_ENABLE_BBR2 "enable bbr2" ON)
@@ -22,14 +22,14 @@ option (XQC_ENABLE_XOR "enable fec scheme xor" OFF)
 option (XQC_ENABLE_RSC "enable fec scheme reed-solomon code" OFF)
 option (XQC_ENABLE_PKM "enable fec scheme packet mask" OFF)
 option (XQC_PING_ATTACK_PROTECT "enable ping attack protection" OFF)
-option (XQC_ENABLE_SEASTAR "enable seastar integration (submodule in third_party/seastar)" ON)
+option (XQC_ENABLE_SEASTAR "enable seastar integration (submodule in third_party/seastar)" OFF)
 
 if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release)
 endif()
 
 
-# SSL lib type, xquic support babassl and boringssl interfaces
+# SSL lib type, xquic support babassl, boringssl, and openssl interfaces
 if(NOT SSL_TYPE)
     set(SSL_TYPE "babassl")
     message(NOTICE "-- SSL_TYPE not set, use default babassl")
@@ -48,6 +48,27 @@ elseif(${SSL_TYPE} MATCHES "boringssl")
     # PATH of ssl, by default XQUIC will use boringssl in third_party
     if(NOT SSL_PATH)
         set(SSL_PATH ${CMAKE_CURRENT_SOURCE_DIR}/third_party/boringssl)
+        message(NOTICE "-- SSL_PATH not set, use default ${SSL_PATH}")
+    endif()
+
+elseif(${SSL_TYPE} MATCHES "openssl")
+    # OpenSSL 3.0+ backend.  Define XQC_SSL_TYPE_OPENSSL so that
+    # xqc_crypto.h selects the correct xqc_aead_impl.h header.
+    add_definitions(-DXQC_SSL_TYPE_OPENSSL=1)
+    if(NOT SSL_PATH)
+        # Search system-standard paths where OpenSSL 3.0 is typically installed:
+        #   /usr           – most Linux distros (apt / yum / dnf)
+        #   /usr/local     – manual `make install` default
+        find_path(_OSSL3_INC NAMES openssl/opensslv.h
+                  PATHS /usr /usr/local
+                  PATH_SUFFIXES include
+                  NO_DEFAULT_PATH)
+        if(_OSSL3_INC)
+            get_filename_component(SSL_PATH "${_OSSL3_INC}/.." ABSOLUTE)
+        else()
+            # Last resort: assume /usr (system OpenSSL)
+            set(SSL_PATH "/usr")
+        endif()
         message(NOTICE "-- SSL_PATH not set, use default ${SSL_PATH}")
     endif()
 endif()
@@ -188,6 +209,17 @@ if(XQC_ENABLE_SEASTAR)
     set(Seastar_DOCS OFF CACHE BOOL "" FORCE)
     set(Seastar_APPS OFF CACHE BOOL "" FORCE)
     set(Seastar_INSTALL OFF CACHE BOOL "" FORCE)
+
+    # Make Seastar use the same SSL library (quictls) as xquic.
+    # CMake's FindOpenSSL respects OPENSSL_ROOT_DIR.
+    if(SSL_PATH AND NOT SSL_PATH STREQUAL "")
+        set(OPENSSL_ROOT_DIR "${SSL_PATH}" CACHE PATH "OpenSSL root for Seastar" FORCE)
+        # quictls installs libs under lib64/
+        set(OPENSSL_CRYPTO_LIBRARY "${SSL_PATH}/lib64/libcrypto.a" CACHE FILEPATH "" FORCE)
+        set(OPENSSL_SSL_LIBRARY    "${SSL_PATH}/lib64/libssl.a"    CACHE FILEPATH "" FORCE)
+        set(OPENSSL_INCLUDE_DIR    "${SSL_PATH}/include"           CACHE PATH     "" FORCE)
+        message(STATUS "Seastar will use SSL from: ${SSL_PATH}")
+    endif()
 
     add_subdirectory(third_party/seastar)
 
@@ -334,6 +366,15 @@ if(${SSL_TYPE} MATCHES "boringssl")
         "src/tls/boringssl/xqc_hkdf_impl.c"
         "src/tls/boringssl/xqc_crypto_impl.c"
         "src/tls/boringssl/xqc_ssl_if_impl.c"
+    )
+elseif(${SSL_TYPE} MATCHES "openssl")
+    set(
+        TLS_SOURCE
+        ${TLS_SOURCE}
+        "src/tls/openssl/xqc_hkdf_impl.c"
+        "src/tls/openssl/xqc_crypto_impl.c"
+        "src/tls/openssl/xqc_ssl_if_impl.c"
+        "src/tls/openssl/xqc_ossl_quic_compat.c"
     )
 elseif(${SSL_TYPE} MATCHES "babassl")
     set(

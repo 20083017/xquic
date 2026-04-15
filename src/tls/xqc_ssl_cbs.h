@@ -6,6 +6,10 @@
 #define XQC_SSL_CBS_H
 
 #include <openssl/ssl.h>
+#include <openssl/opensslv.h>
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L && !defined(OPENSSL_IS_BORINGSSL)
+#include <openssl/evp.h>
+#endif
 
 /**
  * @brief this file describes all the callback functions registered in ssl lib
@@ -41,8 +45,13 @@ int xqc_ssl_alpn_select_cb(SSL *ssl, const unsigned char **out, unsigned char *o
  * @param encrypt 1:encrypt a new ticket; 0:decrypt a ticket
  * @see SSL_CTX_set_tlsext_ticket_key_cb
  */
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L && !defined(OPENSSL_IS_BORINGSSL)
+int xqc_ssl_session_ticket_key_cb(SSL *ssl, unsigned char *key_name, unsigned char *iv,
+    EVP_CIPHER_CTX *ectx, EVP_MAC_CTX *hctx, int encrypt);
+#else
 int xqc_ssl_session_ticket_key_cb(SSL *ssl, unsigned char *key_name, unsigned char *iv,
     EVP_CIPHER_CTX *ectx, HMAC_CTX *hctx, int encrypt);
+#endif
 
 
 /**

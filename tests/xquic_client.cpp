@@ -400,8 +400,8 @@ int XquicClient::init(int argc, char *argv[]) {
             .conn_ping_acked = xqc_client_conn_ping_acked_tramp,
         },
         .stream_cbs = {
-            .stream_write_notify = xqc_client_stream_write_notify_tramp,
             .stream_read_notify = xqc_client_stream_read_notify_tramp,
+            .stream_write_notify = xqc_client_stream_write_notify_tramp,
             .stream_close_notify = xqc_client_stream_close_notify_tramp,
         }
     };

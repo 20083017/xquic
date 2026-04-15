@@ -19,6 +19,8 @@ typedef struct xqc_hdr_protect_cipher_s    xqc_hdr_protect_cipher_t;
 
 #ifdef OPENSSL_IS_BORINGSSL
 #include "src/tls/boringssl/xqc_aead_impl.h"
+#elif defined(XQC_SSL_TYPE_OPENSSL)
+#include "src/tls/openssl/xqc_aead_impl.h"
 #else
 #include "src/tls/babassl/xqc_aead_impl.h"
 #endif

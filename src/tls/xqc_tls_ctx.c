@@ -7,6 +7,7 @@
 #include "xqc_ssl_cbs.h"
 #include "xqc_ssl_if.h"
 #include "src/common/xqc_malloc.h"
+#include <openssl/opensslv.h>
 
 
 typedef struct xqc_tls_ctx_s {
@@ -137,7 +138,11 @@ xqc_create_server_ssl_ctx(xqc_tls_ctx_t *ctx)
         xqc_log(ctx->log, XQC_LOG_WARN, "|read ssl session ticket key error|");
 
     } else {
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L && !defined(OPENSSL_IS_BORINGSSL)
+        SSL_CTX_set_tlsext_ticket_key_evp_cb(ssl_ctx, xqc_ssl_session_ticket_key_cb);
+#else
         SSL_CTX_set_tlsext_ticket_key_cb(ssl_ctx, xqc_ssl_session_ticket_key_cb);
+#endif
     }
 
     SSL_CTX_set_cert_cb(ssl_ctx, xqc_ssl_cert_cb, ctx);

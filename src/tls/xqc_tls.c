@@ -10,6 +10,11 @@
 #include "src/common/xqc_common.h"
 #include <openssl/rand.h>
 #include <openssl/hmac.h>
+#include <openssl/opensslv.h>
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L && !defined(OPENSSL_IS_BORINGSSL)
+#include <openssl/core_names.h>
+#include <openssl/params.h>
+#endif
 
 
 typedef enum xqc_tls_flag_e {
@@ -258,8 +263,12 @@ xqc_tls_init_server_ssl(xqc_tls_t *tls, xqc_tls_config_t *cfg)
 
     /* enable early data and set context */
     xqc_ssl_enable_max_early_data(ssl);
+#if defined(SSL_set_quic_early_data_context)
     SSL_set_quic_early_data_context(ssl, (const uint8_t *)XQC_EARLY_DATA_CONTEXT, 
                                     XQC_EARLY_DATA_CONTEXT_LEN);
+#else
+    SSL_set_quic_early_data_enabled(ssl, 1);
+#endif
 
     return ret;
 }
@@ -374,6 +383,10 @@ fail:
 
 
 /* try to get transport parameter bytes from ssl and notify to Transport layer */
+#if defined(__GNUC__) && __GNUC__ >= 12
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdangling-pointer"
+#endif
 void
 xqc_tls_process_trans_param(xqc_tls_t *tls)
 {
@@ -398,6 +411,9 @@ xqc_tls_process_trans_param(xqc_tls_t *tls)
 
     tls->flag |= XQC_TLS_FLAG_TRANSPORT_PARAM_RCVD;
 }
+#if defined(__GNUC__) && __GNUC__ >= 12
+#pragma GCC diagnostic pop
+#endif
 
 xqc_int_t
 xqc_tls_do_handshake(xqc_tls_t *tls)
@@ -896,11 +912,14 @@ xqc_ssl_alpn_select_cb(SSL *ssl, const unsigned char **out, unsigned char *outle
 
 int
 xqc_ssl_session_ticket_key_cb(SSL *ssl, uint8_t *key_name, uint8_t *iv,
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L && !defined(OPENSSL_IS_BORINGSSL)
+    EVP_CIPHER_CTX *cipher_ctx, EVP_MAC_CTX *hmac_ctx, int encrypt)
+#else
     EVP_CIPHER_CTX *cipher_ctx, HMAC_CTX *hmac_ctx, int encrypt)
+#endif
 {
     size_t size = 0;
     const EVP_CIPHER *cipher = NULL;
-    const EVP_MD *digest = EVP_sha256();
     xqc_tls_t *tls = (xqc_tls_t *)SSL_get_app_data(ssl);
 
     /* get session ticket key */
@@ -932,10 +951,25 @@ xqc_ssl_session_ticket_key_cb(SSL *ssl, uint8_t *key_name, uint8_t *iv,
             return -1;
         }
 
-        if (HMAC_Init_ex(hmac_ctx, key->hmac_key, size, digest, NULL) != 1) {
-            xqc_log(tls->log, XQC_LOG_ERROR, "|HMAC_Init_ex() failed|");
-            return -1;
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L && !defined(OPENSSL_IS_BORINGSSL)
+        {
+            OSSL_PARAM params[2];
+            params[0] = OSSL_PARAM_construct_utf8_string(OSSL_MAC_PARAM_DIGEST, "SHA256", 0);
+            params[1] = OSSL_PARAM_construct_end();
+            if (EVP_MAC_init(hmac_ctx, key->hmac_key, size, params) != 1) {
+                xqc_log(tls->log, XQC_LOG_ERROR, "|EVP_MAC_init() failed|");
+                return -1;
+            }
         }
+#else
+        {
+            const EVP_MD *digest = EVP_sha256();
+            if (HMAC_Init_ex(hmac_ctx, key->hmac_key, size, digest, NULL) != 1) {
+                xqc_log(tls->log, XQC_LOG_ERROR, "|HMAC_Init_ex() failed|");
+                return -1;
+            }
+        }
+#endif
 
         memcpy(key_name, key->name, 16);
 
@@ -958,10 +992,25 @@ xqc_ssl_session_ticket_key_cb(SSL *ssl, uint8_t *key_name, uint8_t *iv,
             size = 32;
         }
 
-        if (HMAC_Init_ex(hmac_ctx, key->hmac_key, size, digest, NULL) != 1) {
-            xqc_log(tls->log, XQC_LOG_ERROR, "|HMAC_Init_ex() failed|");
-            return 0;
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L && !defined(OPENSSL_IS_BORINGSSL)
+        {
+            OSSL_PARAM params[2];
+            params[0] = OSSL_PARAM_construct_utf8_string(OSSL_MAC_PARAM_DIGEST, "SHA256", 0);
+            params[1] = OSSL_PARAM_construct_end();
+            if (EVP_MAC_init(hmac_ctx, key->hmac_key, size, params) != 1) {
+                xqc_log(tls->log, XQC_LOG_ERROR, "|EVP_MAC_init() failed|");
+                return 0;
+            }
         }
+#else
+        {
+            const EVP_MD *digest = EVP_sha256();
+            if (HMAC_Init_ex(hmac_ctx, key->hmac_key, size, digest, NULL) != 1) {
+                xqc_log(tls->log, XQC_LOG_ERROR, "|HMAC_Init_ex() failed|");
+                return 0;
+            }
+        }
+#endif
 
         if (EVP_DecryptInit_ex(cipher_ctx, cipher, NULL, key->aes_key, iv) != 1) {
             xqc_log(tls->log, XQC_LOG_ERROR, "|EVP_DecryptInit_ex() failed|");
@@ -1298,6 +1347,45 @@ xqc_tls_send_alert(SSL *ssl, enum ssl_encryption_level_t level, uint8_t alert)
     return XQC_SSL_SUCCESS;
 }
 
+/*
+ * quictls uses `set_encryption_secrets` (combined read+write) instead of
+ * separate set_read_secret / set_write_secret callbacks used by BoringSSL.
+ */
+#if !defined(OPENSSL_IS_BORINGSSL) && defined(XQC_SSL_TYPE_OPENSSL)
+
+int
+xqc_tls_set_encryption_secrets(SSL *ssl, OSSL_ENCRYPTION_LEVEL level,
+    const uint8_t *read_secret, const uint8_t *write_secret, size_t secret_len)
+{
+    const SSL_CIPHER *cipher = SSL_get_current_cipher(ssl);
+    int ret;
+
+    if (read_secret) {
+        ret = xqc_tls_set_read_secret(ssl, level, cipher, read_secret, secret_len);
+        if (ret != XQC_SSL_SUCCESS) {
+            return ret;
+        }
+    }
+
+    if (write_secret) {
+        ret = xqc_tls_set_write_secret(ssl, level, cipher, write_secret, secret_len);
+        if (ret != XQC_SSL_SUCCESS) {
+            return ret;
+        }
+    }
+
+    return XQC_SSL_SUCCESS;
+}
+
+SSL_QUIC_METHOD xqc_ssl_quic_method = {
+    .set_encryption_secrets = xqc_tls_set_encryption_secrets,
+    .add_handshake_data     = xqc_tls_add_handshake_data,
+    .flush_flight           = xqc_tls_flush_flight,
+    .send_alert             = xqc_tls_send_alert,
+};
+
+#else /* BoringSSL path */
+
 SSL_QUIC_METHOD xqc_ssl_quic_method = {
     .set_read_secret    = xqc_tls_set_read_secret,
     .set_write_secret   = xqc_tls_set_write_secret,
@@ -1305,3 +1393,5 @@ SSL_QUIC_METHOD xqc_ssl_quic_method = {
     .flush_flight       = xqc_tls_flush_flight,
     .send_alert         = xqc_tls_send_alert,
 };
+
+#endif

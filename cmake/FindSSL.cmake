@@ -11,13 +11,13 @@ find_path(SSL_INCLUDE_DIR           NAMES openssl/ssl.h
 # find ssl library
 find_library(SSL_LIBRARY            NAMES ssl
     PATHS ${SSL_DIR}
-    PATH_SUFFIXES lib64 lib build build/ssl
+    PATH_SUFFIXES lib64 lib lib/${CMAKE_LIBRARY_ARCHITECTURE} build build/ssl
     NO_DEFAULT_PATH)
 
 # find crypto library
 find_library(CRYPTO_LIBRARY         NAMES crypto
     PATHS ${SSL_DIR}
-    PATH_SUFFIXES lib64 lib build build/crypto
+    PATH_SUFFIXES lib64 lib lib/${CMAKE_LIBRARY_ARCHITECTURE} build build/crypto
     NO_DEFAULT_PATH)
 
 
@@ -33,13 +33,13 @@ endif()
 # find ssl static library
 find_library(SSL_LIBRARY_STATIC     NAMES ${SSL_LIBRARY_STATIC_NAME}
     PATHS ${SSL_DIR}
-    PATH_SUFFIXES lib64 lib build build/ssl build/ssl/${CMAKE_BUILD_TYPE}
+    PATH_SUFFIXES lib64 lib lib/${CMAKE_LIBRARY_ARCHITECTURE} build build/ssl build/ssl/${CMAKE_BUILD_TYPE}
     NO_DEFAULT_PATH)
 
 # find crypto static library
 find_library(CRYPTO_LIBRARY_STATIC  NAMES ${CRYPTO_LIBRARY_STATIC_NAME}
     PATHS ${SSL_DIR}
-    PATH_SUFFIXES lib64 lib build build/crypto build/crypto/${CMAKE_BUILD_TYPE}
+    PATH_SUFFIXES lib64 lib lib/${CMAKE_LIBRARY_ARCHITECTURE} build build/crypto build/crypto/${CMAKE_BUILD_TYPE}
     NO_DEFAULT_PATH)
 
 include (FindPackageHandleStandardArgs)
