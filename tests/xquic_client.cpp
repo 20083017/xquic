@@ -14,10 +14,13 @@
 #include <time.h>
 #include <iostream>
 #include <vector>
+#include <unordered_map>
 #include <string>
 
 // Global active connection for socket events (Workaround if header cannot be modified)
 static user_conn_t *g_active_u_conn = NULL;
+// Map fd -> user_conn for multi-connection socket dispatch
+static std::unordered_map<int, user_conn_t*> g_fd_conn_map;
 
 // Helper to get current time in microseconds
 static uint64_t xqc_now() {
@@ -33,7 +36,12 @@ extern "C" {
     }
 
     void xqc_client_socket_trampoline(int fd, short what, void *arg) {
-        if (arg) static_cast<XquicClient*>(arg)->on_socket_event(fd, what);
+        if (arg) {
+            user_conn_t *u_conn = (user_conn_t *)arg;
+            if (u_conn->client) {
+                static_cast<XquicClient*>(u_conn->client)->on_socket_event(fd, what, u_conn);
+            }
+        }
     }
 
     void xqc_client_set_event_timer_tramp(xqc_msec_t wake_after, void *user_data) {
@@ -261,6 +269,10 @@ XquicClient::XquicClient() {
     echo_check_ = 0;
     save_file_ = 0;
     write_file_ = "./received_data";
+    num_connections_ = 1;
+    conns_created_ = 0;
+    conns_completed_ = 0;
+    bench_start_time_ = 0;
 }
 
 XquicClient::~XquicClient() {
@@ -272,6 +284,15 @@ XquicClient::~XquicClient() {
         xqc_engine_destroy(engine_);
         engine_ = NULL;
     }
+    // Clean up all connections
+    for (auto *u_conn : conns_) {
+        if (u_conn->ev_socket) event_free(u_conn->ev_socket);
+        if (u_conn->fd >= 0) close(u_conn->fd);
+        if (u_conn->peer_addr) free(u_conn->peer_addr);
+        free(u_conn);
+    }
+    conns_.clear();
+    g_fd_conn_map.clear();
     if (event_base_) {
         event_base_free(event_base_);
         event_base_ = NULL;
@@ -293,6 +314,9 @@ int XquicClient::init(int argc, char *argv[]) {
             echo_check_ = 1;
         } else if (strcmp(argv[i], "-S") == 0) {
             save_file_ = 1;
+        } else if (strcmp(argv[i], "-n") == 0 && i + 1 < argc) {
+            num_connections_ = atoi(argv[++i]);
+            if (num_connections_ < 1) num_connections_ = 1;
         }
     }
 
@@ -415,10 +439,27 @@ int XquicClient::init(int argc, char *argv[]) {
     ev_engine_ = event_new(event_base_, -1, EV_PERSIST, xqc_client_engine_trampoline, this);
     event_add(ev_engine_, NULL);
 
-    // Create Connection
+    // Create batch connections
+    bench_start_time_ = xqc_now();
+    printf("=== Creating %d connections to %s:%d ===\n", num_connections_, server_ip_.c_str(), port_);
+    
+    for (int i = 0; i < num_connections_; i++) {
+        user_conn_t *u_conn = create_one_connection();
+        if (!u_conn) {
+            printf("Failed to create connection %d\n", i);
+            return -1;
+        }
+        conns_.push_back(u_conn);
+    }
+    
+    printf("=== All %d connections initiated ===\n", num_connections_);
+    return 0;
+}
+
+user_conn_t* XquicClient::create_one_connection() {
     user_conn_t *u_conn = (user_conn_t *)calloc(1, sizeof(user_conn_t));
     u_conn->client = this;
-    u_conn->h3 = !transport_only_;  // 如果transport_only_为true，则h3为false；反之亦然
+    u_conn->h3 = !transport_only_;
     
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
@@ -431,27 +472,28 @@ int XquicClient::init(int argc, char *argv[]) {
     u_conn->peer_addrlen = sizeof(addr);
     
     u_conn->fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (u_conn->fd < 0) {
+        free(u_conn->peer_addr);
+        free(u_conn);
+        return NULL;
+    }
     fcntl(u_conn->fd, F_SETFL, O_NONBLOCK);
     
-    u_conn->ev_socket = event_new(event_base_, u_conn->fd, EV_READ | EV_PERSIST, xqc_client_socket_trampoline, this);
+    // Each connection's socket event passes u_conn as arg
+    u_conn->ev_socket = event_new(event_base_, u_conn->fd, EV_READ | EV_PERSIST, xqc_client_socket_trampoline, u_conn);
     event_add(u_conn->ev_socket, NULL);
-
-    // Set global active connection for socket processing
-    g_active_u_conn = u_conn;
+    
+    g_fd_conn_map[u_conn->fd] = u_conn;
+    g_active_u_conn = u_conn; // Keep for backward compat
 
     // Connect
     if (transport_only_) {
         xqc_conn_settings_t conn_settings;
         memset(&conn_settings, 0, sizeof(conn_settings));
-        // xqc_default_conn_settings(&conn_settings);
-        conn_settings.proto_version = XQC_VERSION_V1;  // Ensure protocol version is set correctly
+        conn_settings.proto_version = XQC_VERSION_V1;
         
         xqc_conn_ssl_config_t ssl_config;
         memset(&ssl_config, 0, sizeof(ssl_config));
-        
-        // Additional SSL configuration for better compatibility
-        // ssl_config.tls_groups.group_arr = NULL;
-        // ssl_config.tls_groups.group_num = 0;
         ssl_config.session_ticket_data = NULL;
         ssl_config.transport_parameter_data = NULL;
         
@@ -459,36 +501,49 @@ int XquicClient::init(int argc, char *argv[]) {
                                           (struct sockaddr*)&addr, sizeof(addr), "transport", u_conn);
         if (cid == NULL) {
             printf("xqc_connect error\n");
-            return -1;
+            return NULL;
         }
         memcpy(&u_conn->cid, cid, sizeof(*cid));
     } else {
-        // H3 Connect
         xqc_conn_settings_t conn_settings;
         memset(&conn_settings, 0, sizeof(conn_settings));
-        // xqc_default_conn_settings(&conn_settings);
-        conn_settings.proto_version = XQC_VERSION_V1;  // Ensure protocol version is set correctly
+        conn_settings.proto_version = XQC_VERSION_V1;
         
         xqc_conn_ssl_config_t ssl_config;
         memset(&ssl_config, 0, sizeof(ssl_config));
-        
-        // Additional SSL configuration for better compatibility
-        // ssl_config.tls_groups.group_arr = NULL;
-        // ssl_config.tls_groups.group_num = 0;
         ssl_config.session_ticket_data = NULL;
         ssl_config.transport_parameter_data = NULL;
         
-        // Updated xqc_h3_connect signature: added token/token_len params (NULL, 0) before server_name
         const xqc_cid_t *cid = xqc_h3_connect(engine_, &conn_settings, NULL, 0, server_ip_.c_str(), 1, &ssl_config,
                                              (struct sockaddr*)&addr, sizeof(addr), u_conn);
         if (cid == NULL) {
             printf("xqc_h3_connect error\n");
-            return -1;
+            return NULL;
         }
         memcpy(&u_conn->cid, cid, sizeof(*cid));
     }
     
-    return 0;
+    conns_created_++;
+    return u_conn;
+}
+
+void XquicClient::on_connection_completed() {
+    conns_completed_++;
+    if (conns_completed_ >= num_connections_) {
+        uint64_t elapsed_us = xqc_now() - bench_start_time_;
+        double elapsed_s = elapsed_us / 1000000.0;
+        printf("\n=== BENCHMARK RESULTS ===\n");
+        printf("Total connections: %d\n", num_connections_);
+        printf("Completed: %d\n", conns_completed_);
+        printf("Elapsed: %.3f s\n", elapsed_s);
+        printf("Conn/s: %.1f\n", conns_completed_ / elapsed_s);
+        printf("=========================\n");
+        
+        // Stop event loop
+        if (event_base_) {
+            event_base_loopbreak(event_base_);
+        }
+    }
 }
 
 int XquicClient::start(int argc, char *argv[]) {
@@ -512,7 +567,8 @@ void XquicClient::on_conn_create_notify(xqc_connection_t *conn, const xqc_cid_t 
 }
 
 void XquicClient::on_conn_close_notify(xqc_connection_t *conn, const xqc_cid_t *cid, void *user_data, void *conn_proto_data) {
-    printf("client: conn closed\n");
+    printf("client: conn closed (%d/%d)\n", conns_completed_ + 1, num_connections_);
+    on_connection_completed();
 }
 
 void XquicClient::on_conn_handshake_finished(xqc_connection_t *conn, void *user_data, void *conn_proto_data) {
@@ -570,7 +626,8 @@ void XquicClient::on_h3_conn_create_notify(xqc_h3_conn_t *conn, const xqc_cid_t 
 }
 
 void XquicClient::on_h3_conn_close_notify(xqc_h3_conn_t *conn, const xqc_cid_t *cid, void *user_data) {
-    printf("client: h3 conn closed\n");
+    printf("client: h3 conn closed (%d/%d)\n", conns_completed_ + 1, num_connections_);
+    on_connection_completed();
 }
 
 void XquicClient::on_h3_conn_handshake_finished(xqc_h3_conn_t *h3_conn, void *user_data) {
@@ -817,8 +874,8 @@ void XquicClient::send_request(user_conn_t *u_conn) {
 void XquicClient::set_event_timer(xqc_msec_t wake_after) {
     if (ev_engine_) {
         struct timeval tv;
-        tv.tv_sec = wake_after / 1000;
-        tv.tv_usec = (wake_after % 1000) * 1000;
+        tv.tv_sec = wake_after / 1000000;
+        tv.tv_usec = wake_after % 1000000;
         event_add(ev_engine_, &tv);
     }
 }
@@ -834,23 +891,29 @@ void XquicClient::on_engine_timer() {
     }
 }
 
-void XquicClient::on_socket_event(int fd, short what) {
+void XquicClient::on_socket_event(int fd, short what, user_conn_t *u_conn) {
     if (what & EV_READ) {
-        process_socket_read();
+        process_socket_read(u_conn);
     }
 }
 
-void XquicClient::process_socket_read() {
-    if (!g_active_u_conn || !engine_) {
+void XquicClient::process_socket_read(user_conn_t *u_conn) {
+    if (!u_conn || !engine_) {
         return;
     }
 
-    unsigned char buf[4096];
+    unsigned char buf[65536];
     struct sockaddr_storage peer_addr;
-    socklen_t peer_addrlen = sizeof(peer_addr);
+    socklen_t peer_addrlen;
     
-    ssize_t n = recvfrom(g_active_u_conn->fd, buf, sizeof(buf), 0, (struct sockaddr*)&peer_addr, &peer_addrlen);
-    if (n > 0) {
-         xqc_engine_packet_process(engine_, buf, n, g_active_u_conn->peer_addr, g_active_u_conn->peer_addrlen, (struct sockaddr*)&peer_addr, peer_addrlen, xqc_now(), g_active_u_conn);
+    // 循环读取所有缓冲的数据包
+    while (1) {
+        peer_addrlen = sizeof(peer_addr);
+        ssize_t n = recvfrom(u_conn->fd, buf, sizeof(buf), 0, (struct sockaddr*)&peer_addr, &peer_addrlen);
+        if (n <= 0) break;
+        xqc_engine_packet_process(engine_, buf, n, u_conn->peer_addr, u_conn->peer_addrlen, (struct sockaddr*)&peer_addr, peer_addrlen, xqc_now(), u_conn);
     }
+    
+    // 必须调用 finish_recv 通知引擎处理收到的包
+    xqc_engine_finish_recv(engine_);
 }

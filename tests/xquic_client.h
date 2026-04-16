@@ -8,6 +8,7 @@
 #include <xquic/xqc_http3.h>
 #include "user_conn.h"
 #include <string>
+#include <vector>
 
 class XquicClient {
 public:
@@ -21,8 +22,8 @@ public:
 
     // Event Handlers
     void on_engine_timer();
-    void on_socket_event(int fd, short what);
-    void process_socket_read();
+    void on_socket_event(int fd, short what, user_conn_t *u_conn);
+    void process_socket_read(user_conn_t *u_conn);
 
     // Callback Implementations
     void on_conn_create_notify(xqc_connection_t *conn, const xqc_cid_t *cid, void *user_data, void *conn_proto_data);
@@ -52,6 +53,10 @@ public:
     void send_request(user_conn_t *u_conn);
     void set_event_timer(xqc_msec_t wake_after);
     ssize_t write_socket(const unsigned char *buf, size_t size, const struct sockaddr *peer_addr, socklen_t peer_addrlen, user_conn_t *user_conn);
+    
+    // Batch connection helpers
+    user_conn_t* create_one_connection();
+    void on_connection_completed();
 
 private:
     xqc_engine_t *engine_;
@@ -63,6 +68,17 @@ private:
     int port_;
     int transport_only_;
     std::string log_path_;
+    
+    // Batch connection config
+    int num_connections_;        // -n 参数，总连接数
+    
+    // Stats
+    int conns_created_;
+    int conns_completed_;
+    uint64_t bench_start_time_;
+    
+    // All connections
+    std::vector<user_conn_t*> conns_;
     
     // Test specific
     size_t send_body_size_;

@@ -35,6 +35,21 @@ private:
     bool _stopping;
     bool _send_flush_in_progress;
 
+    // Statistics for benchmarking
+    struct Stats {
+        uint64_t conns_accepted = 0;
+        uint64_t conns_closed = 0;
+        uint64_t h3_requests = 0;
+        uint64_t h3_responses = 0;
+        uint64_t packets_recv = 0;
+        uint64_t packets_sent = 0;
+        uint64_t bytes_recv = 0;
+        uint64_t bytes_sent = 0;
+    } _stats;
+    seastar::timer<> _stats_timer;
+    Stats _stats_prev;
+    void print_stats();
+
     void init_xquic_engine();
     seastar::future<> run_receive_loop();
     void on_datagram(seastar::net::udp_datagram& datagram);

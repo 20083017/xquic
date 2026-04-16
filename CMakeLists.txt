@@ -29,48 +29,13 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 
 
-# SSL lib type, xquic support babassl, boringssl, and openssl interfaces
-if(NOT SSL_TYPE)
-    set(SSL_TYPE "babassl")
-    message(NOTICE "-- SSL_TYPE not set, use default babassl")
-endif()
+# SSL: only quictls (OpenSSL 3.x fork with native QUIC API) is supported.
+# No babassl / boringssl support.
+add_definitions(-DXQC_SSL_TYPE_OPENSSL=1)
 
-if(${SSL_TYPE} MATCHES "babassl")
-    # PATH of ssl, by default XQUIC will use babassl installed in
-    # /usr/local/babassl if SSL_PATH is not set
-    if(NOT SSL_PATH)
-        set(SSL_PATH "/usr/local/babassl")
-        message(NOTICE "-- SSL_PATH not set, use default ${SSL_PATH}")
-    endif()
-
-elseif(${SSL_TYPE} MATCHES "boringssl")
-    add_definitions(-DNOCRYPT=1)
-    # PATH of ssl, by default XQUIC will use boringssl in third_party
-    if(NOT SSL_PATH)
-        set(SSL_PATH ${CMAKE_CURRENT_SOURCE_DIR}/third_party/boringssl)
-        message(NOTICE "-- SSL_PATH not set, use default ${SSL_PATH}")
-    endif()
-
-elseif(${SSL_TYPE} MATCHES "openssl")
-    # OpenSSL 3.0+ backend.  Define XQC_SSL_TYPE_OPENSSL so that
-    # xqc_crypto.h selects the correct xqc_aead_impl.h header.
-    add_definitions(-DXQC_SSL_TYPE_OPENSSL=1)
-    if(NOT SSL_PATH)
-        # Search system-standard paths where OpenSSL 3.0 is typically installed:
-        #   /usr           – most Linux distros (apt / yum / dnf)
-        #   /usr/local     – manual `make install` default
-        find_path(_OSSL3_INC NAMES openssl/opensslv.h
-                  PATHS /usr /usr/local
-                  PATH_SUFFIXES include
-                  NO_DEFAULT_PATH)
-        if(_OSSL3_INC)
-            get_filename_component(SSL_PATH "${_OSSL3_INC}/.." ABSOLUTE)
-        else()
-            # Last resort: assume /usr (system OpenSSL)
-            set(SSL_PATH "/usr")
-        endif()
-        message(NOTICE "-- SSL_PATH not set, use default ${SSL_PATH}")
-    endif()
+if(NOT SSL_PATH)
+    set(SSL_PATH "${CMAKE_CURRENT_SOURCE_DIR}/third_party/quictls/build")
+    message(NOTICE "-- SSL_PATH not set, using bundled quictls: ${SSL_PATH}")
 endif()
 
 # Users can use both SSL_DIR or SSL_PATH to specify the ssl path to find the ssl
@@ -358,32 +323,15 @@ set (
     "src/tls/xqc_tls.c"
 )
 
-if(${SSL_TYPE} MATCHES "boringssl")
-    set(
-        TLS_SOURCE
-        ${TLS_SOURCE}
-        "src/tls/boringssl/xqc_hkdf_impl.c"
-        "src/tls/boringssl/xqc_crypto_impl.c"
-        "src/tls/boringssl/xqc_ssl_if_impl.c"
-    )
-elseif(${SSL_TYPE} MATCHES "openssl")
-    set(
-        TLS_SOURCE
-        ${TLS_SOURCE}
-        "src/tls/openssl/xqc_hkdf_impl.c"
-        "src/tls/openssl/xqc_crypto_impl.c"
-        "src/tls/openssl/xqc_ssl_if_impl.c"
-        "src/tls/openssl/xqc_ossl_quic_compat.c"
-    )
-elseif(${SSL_TYPE} MATCHES "babassl")
-    set(
-        TLS_SOURCE
-        ${TLS_SOURCE}
-        "src/tls/babassl/xqc_hkdf_impl.c"
-        "src/tls/babassl/xqc_crypto_impl.c"
-        "src/tls/babassl/xqc_ssl_if_impl.c"
-    )
-endif()
+# quictls TLS implementation (only backend)
+set(
+    TLS_SOURCE
+    ${TLS_SOURCE}
+    "src/tls/openssl/xqc_hkdf_impl.c"
+    "src/tls/openssl/xqc_crypto_impl.c"
+    "src/tls/openssl/xqc_ssl_if_impl.c"
+    # NOTE: xqc_ossl_quic_compat.c is NOT needed — quictls has native QUIC API
+)
 
 # common source
 set(

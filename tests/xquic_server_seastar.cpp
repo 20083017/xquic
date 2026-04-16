@@ -560,8 +560,10 @@ void XquicSeastarServer::on_datagram(seastar::net::udp_datagram& datagram) {
     }
 
     seastar::net::packet& packet = datagram.get_data();
-    std::cout << "[xquic] recv " << packet.len() << " bytes from "
-              << datagram.get_src() << std::endl;
+    _stats.packets_recv++;
+    _stats.bytes_recv += packet.len();
+    // std::cout << "[xquic] recv " << packet.len() << " bytes from "
+              // << datagram.get_src() << std::endl;
 
     for (auto& frag : packet.fragments()) {
         xqc_int_t rc = xqc_engine_packet_process(_engine,
@@ -573,17 +575,17 @@ void XquicSeastarServer::on_datagram(seastar::net::udp_datagram& datagram) {
                                   peer_len,
                                   xqc_now_us(),
                                   &_packet_user_conn);
-        std::cout << "[xquic] packet_process rc=" << rc << " frag_size=" << frag.size << std::endl;
+        // std::cout << "[xquic] packet_process rc=" << rc << " frag_size=" << frag.size << std::endl;
     }
 
     xqc_engine_finish_recv(_engine);
-    std::cout << "[xquic] finish_recv done, send_queue_empty=" << _send_integration.empty() << std::endl;
+    // std::cout << "[xquic] finish_recv done, send_queue_empty=" << _send_integration.empty() << std::endl;
     schedule_send_flush();
 }
 
 void XquicSeastarServer::on_engine_timer_expire() {
     if (_engine != nullptr) {
-        std::cout << "[xquic] engine_timer_expire" << std::endl;
+        // std::cout << "[xquic] engine_timer_expire" << std::endl;
         xqc_engine_main_logic(_engine);
         schedule_send_flush();
     }
@@ -598,8 +600,8 @@ ssize_t XquicSeastarServer::enqueue_send(const unsigned char *buf, size_t size,
     }
 
     ssize_t queued = _send_integration.enqueue_write(buf, size, peer_addr, peer_addrlen);
-    std::cout << "[xquic] enqueue_send: size=" << size << " queued=" << queued
-              << " queue_empty=" << _send_integration.empty() << std::endl;
+    // std::cout << "[xquic] enqueue_send: size=" << size << " queued=" << queued
+              // << " queue_empty=" << _send_integration.empty() << std::endl;
     if (queued < 0) {
         std::cerr << "[xquic] enqueue_send: enqueue_write failed" << std::endl;
         return -1;
@@ -607,6 +609,8 @@ ssize_t XquicSeastarServer::enqueue_send(const unsigned char *buf, size_t size,
 
     try {
         schedule_send_flush();
+        _stats.packets_sent++;
+        _stats.bytes_sent += size;
         return queued;
 
     } catch (...) {
@@ -620,7 +624,7 @@ void XquicSeastarServer::schedule_send_flush() {
         return;
     }
 
-    std::cout << "[xquic] schedule_send_flush: starting flush" << std::endl;
+    // std::cout << "[xquic] schedule_send_flush: starting flush" << std::endl;
     _send_flush_in_progress = true;
     (void)seastar::with_gate(_background_ops, [this] {
         return flush_send_queue();
@@ -647,21 +651,21 @@ seastar::future<> XquicSeastarServer::flush_send_queue() {
         return seastar::make_ready_future<>();
     }
 
-    std::cout << "[xquic] flush_send_queue: flushing" << std::endl;
+    // std::cout << "[xquic] flush_send_queue: flushing" << std::endl;
     return _send_integration.flush_to(*_udp_channel).then([] {
-        std::cout << "[xquic] flush_send_queue: done" << std::endl;
+        // std::cout << "[xquic] flush_send_queue: done" << std::endl;
     });
 }
 
 void XquicSeastarServer::send_h3_response(user_stream_t *user_stream) {
     if (user_stream == nullptr || user_stream->h3_request == nullptr || user_stream->header_sent) {
-        std::cout << "[xquic] send_h3_response: skipped (null=" << (user_stream == nullptr)
-                  << " h3_req=" << (user_stream ? user_stream->h3_request : nullptr)
-                  << " header_sent=" << (user_stream ? user_stream->header_sent : -1) << ")" << std::endl;
+        // std::cout << "[xquic] send_h3_response: skipped (null=" << (user_stream == nullptr)
+                  // << " h3_req=" << (user_stream ? user_stream->h3_request : nullptr)
+                  // << " header_sent=" << (user_stream ? user_stream->header_sent : -1) << ")" << std::endl;
         return;
     }
 
-    std::cout << "[xquic] send_h3_response: sending headers + body" << std::endl;
+    // std::cout << "[xquic] send_h3_response: sending headers + body" << std::endl;
 
     xqc_http_header_t headers[] = {
         {
@@ -686,6 +690,7 @@ void XquicSeastarServer::send_h3_response(user_stream_t *user_stream) {
     };
 
     user_stream->header_sent = 1;
+    _stats.h3_responses++;
     xqc_h3_request_send_headers(reinterpret_cast<xqc_h3_request_t*>(user_stream->h3_request), &response_headers, 0);
     xqc_h3_request_send_body(reinterpret_cast<xqc_h3_request_t*>(user_stream->h3_request),
                              const_cast<unsigned char*>(kH3ResponseBody),
@@ -697,7 +702,7 @@ int XquicSeastarServer::on_server_accept(xqc_engine_t *engine, xqc_connection_t 
     (void)engine;
     (void)user_data;
 
-    std::cout << "[xquic] server_accept called" << std::endl;
+    // std::cout << "[xquic] server_accept called" << std::endl;
 
     try {
         auto u_conn = std::make_unique<user_conn_t>();
@@ -710,8 +715,9 @@ int XquicSeastarServer::on_server_accept(xqc_engine_t *engine, xqc_connection_t 
             release_user_conn(u_conn.get());
             return -1;
         }
+        _stats.conns_accepted++;
         xqc_conn_set_transport_user_data(conn, u_conn.release());
-        std::cout << "[xquic] server_accept: connection accepted" << std::endl;
+        // std::cout << "[xquic] server_accept: connection accepted" << std::endl;
         return 0;
 
     } catch (const std::bad_alloc&) {
@@ -724,7 +730,7 @@ void XquicSeastarServer::on_conn_update_cid_notify(xqc_connection_t *conn, const
                                                    const xqc_cid_t *new_cid, void *user_data) {
     (void)conn;
     (void)retire_cid;
-    std::cout << "[xquic] conn_update_cid_notify" << std::endl;
+    // std::cout << "[xquic] conn_update_cid_notify" << std::endl;
 
     auto *u_conn = static_cast<user_conn_t*>(user_data);
     if (u_conn != nullptr && new_cid != nullptr) {
@@ -736,7 +742,7 @@ int XquicSeastarServer::on_conn_create_notify(xqc_connection_t *conn, const xqc_
                                               void *user_data, void *conn_proto_data) {
     (void)conn;
     (void)conn_proto_data;
-    std::cout << "[xquic] conn_create_notify user_data=" << user_data << std::endl;
+    // std::cout << "[xquic] conn_create_notify user_data=" << user_data << std::endl;
 
     auto *u_conn = static_cast<user_conn_t*>(user_data);
     if (u_conn == nullptr) {
@@ -755,7 +761,8 @@ int XquicSeastarServer::on_conn_close_notify(xqc_connection_t *conn, const xqc_c
     (void)conn;
     (void)cid;
     (void)conn_proto_data;
-    std::cout << "[xquic] conn_close_notify" << std::endl;
+    // std::cout << "[xquic] conn_close_notify" << std::endl;
+    _stats.conns_closed++;
 
     auto u_conn = std::unique_ptr<user_conn_t>(static_cast<user_conn_t*>(user_data));
     release_user_conn(u_conn.get());
@@ -768,15 +775,15 @@ xqc_int_t XquicSeastarServer::on_stream_write_notify(xqc_stream_t *stream, void 
         return 0;
     }
 
-    std::cout << "[xquic] stream_write_notify: offset=" << user_stream->send_offset
-              << " total=" << user_stream->send_body_len << std::endl;
+    // std::cout << "[xquic] stream_write_notify: offset=" << user_stream->send_offset
+              // << " total=" << user_stream->send_body_len << std::endl;
 
     while (user_stream->send_offset < user_stream->send_body_len) {
         const size_t remaining = user_stream->send_body_len - user_stream->send_offset;
         const ssize_t sent = xqc_stream_send(stream,
             reinterpret_cast<unsigned char*>(user_stream->send_body + user_stream->send_offset), remaining, 1);
         if (sent == -XQC_EAGAIN) {
-            std::cout << "[xquic] stream_write_notify: EAGAIN" << std::endl;
+            // std::cout << "[xquic] stream_write_notify: EAGAIN" << std::endl;
             return 0;
         }
         if (sent < 0) {
@@ -786,7 +793,7 @@ xqc_int_t XquicSeastarServer::on_stream_write_notify(xqc_stream_t *stream, void 
 
         user_stream->send_offset += static_cast<size_t>(sent);
         user_stream->total_sent += static_cast<size_t>(sent);
-        std::cout << "[xquic] stream_write_notify: sent=" << sent << " total_sent=" << user_stream->total_sent << std::endl;
+        // std::cout << "[xquic] stream_write_notify: sent=" << sent << " total_sent=" << user_stream->total_sent << std::endl;
     }
 
     return 0;
@@ -794,7 +801,7 @@ xqc_int_t XquicSeastarServer::on_stream_write_notify(xqc_stream_t *stream, void 
 
 xqc_int_t XquicSeastarServer::on_stream_create_notify(xqc_stream_t *stream, void *user_data) {
     (void)user_data;
-    std::cout << "[xquic] stream_create_notify: stream_id=" << xqc_stream_id(stream) << std::endl;
+    // std::cout << "[xquic] stream_create_notify: stream_id=" << xqc_stream_id(stream) << std::endl;
     try {
         auto owned_stream = std::make_unique<user_stream_t>();
         owned_stream->server = this;
@@ -817,7 +824,7 @@ xqc_int_t XquicSeastarServer::on_stream_read_notify(xqc_stream_t *stream, void *
         return -1;
     }
 
-    std::cout << "[xquic] stream_read_notify: stream_id=" << xqc_stream_id(stream) << std::endl;
+    // std::cout << "[xquic] stream_read_notify: stream_id=" << xqc_stream_id(stream) << std::endl;
 
     unsigned char body[4096];
     unsigned char fin = 0;
@@ -832,8 +839,8 @@ xqc_int_t XquicSeastarServer::on_stream_read_notify(xqc_stream_t *stream, void *
         }
 
         user_stream->total_recvd += static_cast<size_t>(read);
-        std::cout << "[xquic] stream_read_notify: read=" << read << " total=" << user_stream->total_recvd
-                  << " fin=" << (int)fin << std::endl;
+        // std::cout << "[xquic] stream_read_notify: read=" << read << " total=" << user_stream->total_recvd
+                  // << " fin=" << (int)fin << std::endl;
         if (!append_stream_payload(user_stream, body, static_cast<size_t>(read))) {
             return -1;
         }
@@ -846,7 +853,7 @@ xqc_int_t XquicSeastarServer::on_stream_read_notify(xqc_stream_t *stream, void *
         return 0;
     }
 
-    std::cout << "[xquic] stream_read_notify: FIN received, building response" << std::endl;
+    // std::cout << "[xquic] stream_read_notify: FIN received, building response" << std::endl;
     if (user_stream->send_body == nullptr && !build_transport_demo_response(stream, user_stream)) {
         std::cerr << "[xquic] stream_read_notify: build_transport_demo_response failed" << std::endl;
         return -1;
@@ -856,7 +863,7 @@ xqc_int_t XquicSeastarServer::on_stream_read_notify(xqc_stream_t *stream, void *
 }
 
 xqc_int_t XquicSeastarServer::on_stream_close_notify(xqc_stream_t *stream, void *user_data) {
-    std::cout << "[xquic] stream_close_notify: stream_id=" << xqc_stream_id(stream) << std::endl;
+    // std::cout << "[xquic] stream_close_notify: stream_id=" << xqc_stream_id(stream) << std::endl;
     (void)stream;
 
     auto user_stream = std::unique_ptr<user_stream_t>(static_cast<user_stream_t*>(user_data));
@@ -865,7 +872,7 @@ xqc_int_t XquicSeastarServer::on_stream_close_notify(xqc_stream_t *stream, void 
 }
 
 int XquicSeastarServer::on_h3_conn_create_notify(xqc_h3_conn_t *conn, const xqc_cid_t *cid, void *user_data) {
-    std::cout << "[xquic] h3_conn_create_notify" << std::endl;
+    // std::cout << "[xquic] h3_conn_create_notify" << std::endl;
     auto *u_conn = static_cast<user_conn_t*>(user_data);
     if (u_conn == nullptr) {
         std::cerr << "[xquic] h3_conn_create_notify: user_data is NULL!" << std::endl;
@@ -884,7 +891,7 @@ int XquicSeastarServer::on_h3_conn_create_notify(xqc_h3_conn_t *conn, const xqc_
 int XquicSeastarServer::on_h3_conn_close_notify(xqc_h3_conn_t *conn, const xqc_cid_t *cid, void *user_data) {
     (void)conn;
     (void)cid;
-    std::cout << "[xquic] h3_conn_close_notify" << std::endl;
+    // std::cout << "[xquic] h3_conn_close_notify" << std::endl;
     auto u_conn = std::unique_ptr<user_conn_t>(static_cast<user_conn_t*>(user_data));
     release_user_conn(u_conn.get());
     return 0;
@@ -892,14 +899,15 @@ int XquicSeastarServer::on_h3_conn_close_notify(xqc_h3_conn_t *conn, const xqc_c
 
 xqc_int_t XquicSeastarServer::on_h3_request_write_notify(xqc_h3_request_t *req, void *user_data) {
     (void)req;
-    std::cout << "[xquic] h3_request_write_notify" << std::endl;
+    // std::cout << "[xquic] h3_request_write_notify" << std::endl;
     send_h3_response(static_cast<user_stream_t*>(user_data));
     return 0;
 }
 
 xqc_int_t XquicSeastarServer::on_h3_request_read_notify(xqc_h3_request_t *req,
                                                         xqc_request_notify_flag_t flag, void *user_data) {
-    std::cout << "[xquic] h3_request_read_notify: flag=0x" << std::hex << flag << std::dec << std::endl;
+    _stats.h3_requests++;
+    // std::cout << "[xquic] h3_request_read_notify: flag=0x" << std::hex << flag << std::dec << std::endl;
     user_stream_t *user_stream = static_cast<user_stream_t*>(user_data);
     if (user_stream == nullptr) {
         try {
@@ -951,7 +959,7 @@ xqc_int_t XquicSeastarServer::on_h3_request_read_notify(xqc_h3_request_t *req,
 
 xqc_int_t XquicSeastarServer::on_h3_request_close_notify(xqc_h3_request_t *req, void *user_data) {
     (void)req;
-    std::cout << "[xquic] h3_request_close_notify" << std::endl;
+    // std::cout << "[xquic] h3_request_close_notify" << std::endl;
     auto user_stream = std::unique_ptr<user_stream_t>(static_cast<user_stream_t*>(user_data));
     release_user_stream(user_stream.get());
     return 0;
@@ -963,7 +971,7 @@ void XquicSeastarServer::ss_set_event_timer(xqc_msec_t wake_after, void *user_da
         return;
     }
 
-    std::cout << "[xquic] set_event_timer: wake_after=" << wake_after << "us" << std::endl;
+    // std::cout << "[xquic] set_event_timer: wake_after=" << wake_after << "us" << std::endl;
     server->_engine_timer.cancel();
     server->_engine_timer.arm(std::chrono::microseconds(wake_after));
 }
@@ -980,7 +988,7 @@ ssize_t XquicSeastarServer::ss_write_socket(const unsigned char *buf, size_t siz
     }
 
     ssize_t ret = server->enqueue_send(buf, size, peer_addr, peer_addrlen);
-    std::cout << "[xquic] write_socket: size=" << size << " ret=" << ret << std::endl;
+    // std::cout << "[xquic] write_socket: size=" << size << " ret=" << ret << std::endl;
     return ret;
 }
 

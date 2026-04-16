@@ -17,13 +17,8 @@ typedef struct xqc_hdr_protect_cipher_s    xqc_hdr_protect_cipher_t;
 #undef  XQC_CRYPTO_PRIVATE
 #define XQC_CRYPTO_PRIVATE
 
-#ifdef OPENSSL_IS_BORINGSSL
-#include "src/tls/boringssl/xqc_aead_impl.h"
-#elif defined(XQC_SSL_TYPE_OPENSSL)
+/* quictls (OpenSSL 3.x with QUIC API) — only supported backend */
 #include "src/tls/openssl/xqc_aead_impl.h"
-#else
-#include "src/tls/babassl/xqc_aead_impl.h"
-#endif
 
 #undef  XQC_CRYPTO_PRIVATE
 

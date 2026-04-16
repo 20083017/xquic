@@ -11,14 +11,14 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 set(XQC_BINARY_TYPE SHARED)
 
-# SSL lib type, xquic support babassl and boringssl interfaces
+# SSL: quictls only
 if(NOT SSL_TYPE)
-    set(SSL_TYPE "babassl")
+    set(SSL_TYPE "openssl")
 endif()
 
 # PATH of ssl
 if(NOT SSL_PATH)
-    set(SSL_PATH "/usr/local/babassl")
+    set(SSL_PATH "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/quictls/build")
 endif()
 
 # ssl include path
@@ -269,23 +269,14 @@ set (
     "src/tls/xqc_tls.c"
 )
 
-if(${SSL_TYPE} MATCHES "boringssl")
-    set(
-        TLS_SOURCE
-        ${TLS_SOURCE}
-        "src/tls/boringssl/xqc_hkdf_impl.c"
-        "src/tls/boringssl/xqc_crypto_impl.c"
-        "src/tls/boringssl/xqc_ssl_if_impl.c"
-    )
-elseif(${SSL_TYPE} MATCHES "babassl")
-    set(
-        TLS_SOURCE
-        ${TLS_SOURCE}
-        "src/tls/babassl/xqc_hkdf_impl.c"
-        "src/tls/babassl/xqc_crypto_impl.c"
-        "src/tls/babassl/xqc_ssl_if_impl.c"
-    )
-endif()
+# quictls TLS implementation (only backend)
+set(
+    TLS_SOURCE
+    ${TLS_SOURCE}
+    "src/tls/openssl/xqc_hkdf_impl.c"
+    "src/tls/openssl/xqc_crypto_impl.c"
+    "src/tls/openssl/xqc_ssl_if_impl.c"
+)
 
 # common source
 set(
