@@ -1,19 +1,20 @@
 #pragma once
 
+#include <seastar/core/temporary_buffer.hh>
 #include <seastar/net/api.hh>
 #include <cstddef>
+#include <cstring>
 #include <deque>
 #include <stdexcept>
 #include <utility>
-#include <vector>
 
 class XquicSeastarSendQueue {
 public:
-    static constexpr size_t kDefaultCapacity = 1024;
+    static constexpr size_t kDefaultCapacity = 4096;
 
     struct Datagram {
         seastar::socket_address peer;
-        std::vector<unsigned char> payload;
+        seastar::temporary_buffer<char> payload;
     };
 
     explicit XquicSeastarSendQueue(size_t capacity = kDefaultCapacity)
@@ -36,23 +37,23 @@ public:
         _queue.clear();
     }
 
+    /// Single memcpy into temporary_buffer; no further copies in flush_to.
     bool push(seastar::socket_address peer, const unsigned char *payload, size_t payload_len) {
         if (full()) {
             return false;
         }
-
         if (payload == nullptr && payload_len != 0) {
             return false;
         }
 
-        std::vector<unsigned char> payload_copy;
+        seastar::temporary_buffer<char> buf(payload_len);
         if (payload_len != 0) {
-            payload_copy.assign(payload, payload + payload_len);
+            std::memcpy(buf.get_write(), payload, payload_len);
         }
 
         _queue.push_back(Datagram{
             std::move(peer),
-            std::move(payload_copy),
+            std::move(buf),
         });
         return true;
     }

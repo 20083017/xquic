@@ -2,6 +2,8 @@
 
 #include "platform.h"
 #include "user_conn.h"
+#include <xquic/xqc_video_frame.h>
+#include <sys/stat.h>
 
 #include <algorithm>
 #include <seastar/core/app-template.hh>
@@ -31,8 +33,8 @@ namespace {
 
 using XqcHeadersPtr = std::unique_ptr<xqc_http_headers_t, decltype(&std::free)>;
 constexpr char kTransportAlpn[] = "transport";
-constexpr size_t kTransportPreviewLimit = 96;
 constexpr size_t kTransportFrameHeaderLen = 5;
+constexpr size_t kTransportPreviewLimit = 128;
 
 enum TransportDemoFrameType : uint8_t {
     XQC_TRANSPORT_DEMO_FRAME_HELLO = 0x01,
@@ -56,10 +58,8 @@ struct TransportDemoRequest {
 const char kH3StatusName[] = ":status";
 const char kH3StatusValue[] = "200";
 const char kH3ContentLengthName[] = "content-length";
-const char kH3ContentLengthValue[] = "24";
 const char kH3ContentTypeName[] = "content-type";
 const char kH3ContentTypeValue[] = "text/plain";
-const unsigned char kH3ResponseBody[] = "Hello from Seastar XQUIC";
 
 #include <sys/time.h>
 
@@ -149,76 +149,40 @@ void release_user_stream(user_stream_t *user_stream) {
 }
 
 std::string format_socket_address(const sockaddr *addr, socklen_t addr_len) {
-    if (addr == nullptr) {
-        return "unknown";
-    }
-
+    if (addr == nullptr) return "unknown";
     char host[INET6_ADDRSTRLEN] = {0};
     uint16_t port = 0;
     if (addr->sa_family == AF_INET && addr_len >= static_cast<socklen_t>(sizeof(sockaddr_in))) {
-        const auto *addr4 = reinterpret_cast<const sockaddr_in*>(addr);
-        if (inet_ntop(AF_INET, &addr4->sin_addr, host, sizeof(host)) == nullptr) {
-            return "unknown";
-        }
-        port = ntohs(addr4->sin_port);
-
+        const auto *a = reinterpret_cast<const sockaddr_in*>(addr);
+        inet_ntop(AF_INET, &a->sin_addr, host, sizeof(host));
+        port = ntohs(a->sin_port);
     } else if (addr->sa_family == AF_INET6 && addr_len >= static_cast<socklen_t>(sizeof(sockaddr_in6))) {
-        const auto *addr6 = reinterpret_cast<const sockaddr_in6*>(addr);
-        if (inet_ntop(AF_INET6, &addr6->sin6_addr, host, sizeof(host)) == nullptr) {
-            return "unknown";
-        }
-        port = ntohs(addr6->sin6_port);
-
+        const auto *a = reinterpret_cast<const sockaddr_in6*>(addr);
+        inet_ntop(AF_INET6, &a->sin6_addr, host, sizeof(host));
+        port = ntohs(a->sin6_port);
     } else {
         return "unknown";
     }
-
     return std::string(host) + ":" + std::to_string(port);
-}
-
-std::string preview_transport_payload(const char *data, size_t len) {
-    if (data == nullptr || len == 0) {
-        return "<empty>";
-    }
-
-    const size_t preview_len = std::min(len, kTransportPreviewLimit);
-    std::string preview;
-    preview.reserve(preview_len + 3);
-    for (size_t i = 0; i < preview_len; ++i) {
-        const unsigned char ch = static_cast<unsigned char>(data[i]);
-        preview.push_back(std::isprint(ch) != 0 ? static_cast<char>(ch) : '.');
-    }
-    if (len > preview_len) {
-        preview += "...";
-    }
-    return preview;
 }
 
 bool ensure_stream_recv_capacity(user_stream_t *user_stream, size_t extra_len) {
     if (user_stream->recv_body_len + extra_len <= user_stream->recv_body_cap) {
         return true;
     }
-
-    size_t new_cap = user_stream->recv_body_cap == 0 ? 4096 : user_stream->recv_body_cap;
+    size_t new_cap = user_stream->recv_body_cap == 0 ? 65536 : user_stream->recv_body_cap;
     while (new_cap < user_stream->recv_body_len + extra_len) {
-        new_cap = std::max(new_cap * 2, user_stream->recv_body_len + extra_len);
+        new_cap *= 2;
     }
-
     void *new_buf = std::realloc(user_stream->recv_body, new_cap);
-    if (new_buf == nullptr) {
-        return false;
-    }
-
+    if (new_buf == nullptr) return false;
     user_stream->recv_body = static_cast<char*>(new_buf);
     user_stream->recv_body_cap = new_cap;
     return true;
 }
 
 bool append_stream_payload(user_stream_t *user_stream, const unsigned char *data, size_t data_len) {
-    if (!ensure_stream_recv_capacity(user_stream, data_len)) {
-        return false;
-    }
-
+    if (!ensure_stream_recv_capacity(user_stream, data_len)) return false;
     std::memcpy(user_stream->recv_body + user_stream->recv_body_len, data, data_len);
     user_stream->recv_body_len += data_len;
     return true;
@@ -241,9 +205,7 @@ void append_u32_be(std::string& out, uint32_t value) {
 void append_transport_frame(std::string& out, uint8_t type, const char *data, size_t len) {
     out.push_back(static_cast<char>(type));
     append_u32_be(out, static_cast<uint32_t>(len));
-    if (len > 0) {
-        out.append(data, len);
-    }
+    if (len > 0) out.append(data, len);
 }
 
 void append_transport_frame(std::string& out, uint8_t type, const std::string& payload) {
@@ -253,89 +215,125 @@ void append_transport_frame(std::string& out, uint8_t type, const std::string& p
 bool parse_transport_demo_request(const char *data, size_t len, TransportDemoRequest& request) {
     size_t offset = 0;
     while (offset < len) {
-        if (len - offset < kTransportFrameHeaderLen) {
-            request.error = "incomplete frame header";
-            return false;
-        }
-
+        if (len - offset < kTransportFrameHeaderLen) { request.error = "incomplete frame header"; return false; }
         const uint8_t type = static_cast<uint8_t>(data[offset]);
         const uint32_t payload_len = read_u32_be(reinterpret_cast<const unsigned char*>(data + offset + 1));
         offset += kTransportFrameHeaderLen;
-        if (len - offset < payload_len) {
-            request.error = "truncated frame payload";
-            return false;
-        }
-
+        if (len - offset < payload_len) { request.error = "truncated frame payload"; return false; }
         const char *payload = data + offset;
         request.frame_count++;
         switch (type) {
-        case XQC_TRANSPORT_DEMO_FRAME_HELLO:
-            request.hello.assign(payload, payload_len);
-            break;
-        case XQC_TRANSPORT_DEMO_FRAME_MESSAGE:
-            request.message.append(payload, payload_len);
-            request.has_message = true;
-            break;
-        case XQC_TRANSPORT_DEMO_FRAME_METADATA:
-            request.metadata.append(payload, payload_len);
-            break;
-        default:
-            request.error = "unknown frame type: " + std::to_string(type);
-            return false;
+        case XQC_TRANSPORT_DEMO_FRAME_HELLO:    request.hello.assign(payload, payload_len); break;
+        case XQC_TRANSPORT_DEMO_FRAME_MESSAGE:  request.message.append(payload, payload_len); request.has_message = true; break;
+        case XQC_TRANSPORT_DEMO_FRAME_METADATA: request.metadata.append(payload, payload_len); break;
+        default: request.error = "unknown frame type: " + std::to_string(type); return false;
         }
-
         offset += payload_len;
     }
-
-    if (!request.has_message) {
-        request.error = "missing MESSAGE frame";
-        return false;
-    }
-
+    if (!request.has_message) { request.error = "missing MESSAGE frame"; return false; }
     return true;
 }
 
-bool build_transport_demo_response(xqc_stream_t *stream, user_stream_t *user_stream) {
-    if (stream == nullptr || user_stream == nullptr || user_stream->user_conn == nullptr) {
-        return false;
-    }
+bool build_framed_response(xqc_stream_t *stream, user_stream_t *user_stream) {
+    if (user_stream == nullptr || user_stream->user_conn == nullptr) return false;
 
     TransportDemoRequest request;
-    const bool parse_ok = parse_transport_demo_request(user_stream->recv_body, user_stream->recv_body_len, request);
+    const bool ok = parse_transport_demo_request(user_stream->recv_body, user_stream->recv_body_len, request);
     const std::string peer = format_socket_address(user_stream->user_conn->peer_addr, user_stream->user_conn->peer_addrlen);
-    const std::string local = format_socket_address(user_stream->user_conn->local_addr, user_stream->user_conn->local_addrlen);
-    const std::string preview = preview_transport_payload(
-        parse_ok ? request.message.data() : user_stream->recv_body,
-        parse_ok ? request.message.size() : user_stream->recv_body_len);
+
     std::string response;
     append_transport_frame(response,
-        parse_ok ? XQC_TRANSPORT_DEMO_FRAME_STATUS : XQC_TRANSPORT_DEMO_FRAME_ERROR,
-        parse_ok ? std::string("ok") : request.error);
+        ok ? XQC_TRANSPORT_DEMO_FRAME_STATUS : XQC_TRANSPORT_DEMO_FRAME_ERROR,
+        ok ? std::string("ok") : request.error);
 
-    const std::string result =
-        "stream_id=" + std::to_string(xqc_stream_id(stream)) + "\n"
+    std::string stream_id_str = stream ? std::to_string(xqc_stream_id(stream)) : "h3";
+    std::string info = "stream_id=" + stream_id_str + "\n"
         "peer=" + peer + "\n"
-        "local=" + local + "\n"
         "request_bytes=" + std::to_string(user_stream->recv_body_len) + "\n"
-        "request_frames=" + std::to_string(request.frame_count) + "\n"
-        "hello=" + (request.hello.empty() ? std::string("<none>") : request.hello) + "\n"
-        "metadata=" + (request.metadata.empty() ? std::string("<none>") : request.metadata) + "\n";
-    append_transport_frame(response, XQC_TRANSPORT_DEMO_FRAME_INFO, result);
+        "request_frames=" + std::to_string(request.frame_count) + "\n";
+    append_transport_frame(response, XQC_TRANSPORT_DEMO_FRAME_INFO, info);
 
-    const std::string message_payload = parse_ok ? preview : "request rejected";
-    append_transport_frame(response, XQC_TRANSPORT_DEMO_FRAME_RESULT, message_payload);
-
-    auto buffer = std::unique_ptr<char, decltype(&std::free)>(
-        static_cast<char*>(std::malloc(response.size())), &std::free);
-    if (buffer == nullptr) {
-        return false;
+    // Echo the message back as result
+    if (ok) {
+        append_transport_frame(response, XQC_TRANSPORT_DEMO_FRAME_RESULT, request.message);
     }
 
-    std::memcpy(buffer.get(), response.data(), response.size());
+    auto buffer = static_cast<char*>(std::malloc(response.size()));
+    if (!buffer) return false;
+    std::memcpy(buffer, response.data(), response.size());
     std::free(user_stream->send_body);
-    user_stream->send_body = buffer.release();
+    user_stream->send_body = buffer;
     user_stream->send_body_len = response.size();
     user_stream->send_offset = 0;
+    return true;
+}
+
+/* ─── Video stream receiver ───────────────────────────────────── */
+
+/**
+ * Process video frame data accumulated in user_stream->recv_body.
+ * Parses [16B header][payload] frames and writes NAL payloads to
+ * an Annex-B .h264 file.  Uses recv_body as a reassembly buffer.
+ *
+ * recv_body_fp is opened lazily on first frame.
+ */
+bool process_video_frames(user_stream_t *user_stream, const std::string &output_dir) {
+    if (!user_stream || !user_stream->recv_body || user_stream->recv_body_len == 0) {
+        return true; /* nothing to process */
+    }
+
+    const unsigned char *data = reinterpret_cast<const unsigned char*>(user_stream->recv_body);
+    size_t len = user_stream->recv_body_len;
+    size_t offset = 0;
+
+    while (offset + XQC_VIDEO_FRAME_HEADER_LEN <= len) {
+        xqc_video_frame_header_t hdr;
+        if (xqc_video_frame_header_decode(data + offset, len - offset, &hdr) != 0) {
+            break; /* incomplete header — wait for more data */
+        }
+
+        if (offset + XQC_VIDEO_FRAME_HEADER_LEN + hdr.payload_len > len) {
+            break; /* incomplete payload — wait for more data */
+        }
+
+        /* Open output file lazily: output_dir/cam_<camera_id>.h264 */
+        if (!user_stream->recv_body_fp) {
+            mkdir(output_dir.c_str(), 0755);
+            char filename[256];
+            snprintf(filename, sizeof(filename), "%s/cam_%u.h264",
+                     output_dir.c_str(), hdr.camera_id);
+            user_stream->recv_body_fp = fopen(filename, "wb");
+            if (!user_stream->recv_body_fp) {
+                std::cerr << "[video] Cannot open " << filename << ": " << strerror(errno) << std::endl;
+                return false;
+            }
+            std::cout << "[video] Recording camera " << hdr.camera_id
+                      << " to " << filename << std::endl;
+        }
+
+        /* Write Annex-B start code + NAL payload */
+        const unsigned char start_code[] = {0x00, 0x00, 0x00, 0x01};
+        fwrite(start_code, 1, sizeof(start_code), user_stream->recv_body_fp);
+        fwrite(data + offset + XQC_VIDEO_FRAME_HEADER_LEN, 1, hdr.payload_len,
+               user_stream->recv_body_fp);
+
+        offset += XQC_VIDEO_FRAME_HEADER_LEN + hdr.payload_len;
+
+        if (hdr.flags & XQC_VIDEO_FLAG_EOS) {
+            std::cout << "[video] Camera " << hdr.camera_id << " EOS received" << std::endl;
+            fclose(user_stream->recv_body_fp);
+            user_stream->recv_body_fp = nullptr;
+        }
+    }
+
+    /* Compact: remove consumed bytes from recv_body */
+    if (offset > 0 && offset < len) {
+        std::memmove(user_stream->recv_body, user_stream->recv_body + offset, len - offset);
+        user_stream->recv_body_len -= offset;
+    } else if (offset >= len) {
+        user_stream->recv_body_len = 0;
+    }
+
     return true;
 }
 
@@ -348,7 +346,9 @@ XquicSeastarServer::XquicSeastarServer()
     , _packet_user_conn()
     , _port(0)
     , _stopping(false)
-    , _send_flush_in_progress(false) {
+    , _send_flush_in_progress(false)
+    , _echo_mode(false)
+    , _video_mode(false) {
     _packet_user_conn.server = this;
 }
 
@@ -420,7 +420,11 @@ void XquicSeastarServer::init_xquic_engine() {
     }
 }
 
-seastar::future<> XquicSeastarServer::start(uint16_t port, const std::string& cert_path, const std::string& key_path) {
+seastar::future<> XquicSeastarServer::start(uint16_t port, const std::string& cert_path, const std::string& key_path,
+                                            bool echo_mode, bool video_mode, const std::string& video_output_dir) {
+    _echo_mode = echo_mode;
+    _video_mode = video_mode;
+    _video_output_dir = video_output_dir;
     try {
         _port = port;
         _cert_path = cert_path;
@@ -445,6 +449,11 @@ seastar::future<> XquicSeastarServer::start(uint16_t port, const std::string& ce
             })
         );
 
+        /* Start periodic stats printer (every 2 seconds) */
+        _stats_prev = {};
+        _stats_timer.set_callback([this] { print_stats(); });
+        _stats_timer.arm_periodic(std::chrono::seconds(2));
+
         std::cout << "Seastar XQUIC server listening on UDP port " << _port << std::endl;
         return seastar::make_ready_future<>();
 
@@ -468,6 +477,7 @@ seastar::future<> XquicSeastarServer::stop() {
 
     _stopping = true;
     _engine_timer.cancel();
+    _stats_timer.cancel();
 
     if (_udp_channel) {
         _udp_channel->shutdown_input();
@@ -658,24 +668,20 @@ seastar::future<> XquicSeastarServer::flush_send_queue() {
 }
 
 void XquicSeastarServer::send_h3_response(user_stream_t *user_stream) {
-    if (user_stream == nullptr || user_stream->h3_request == nullptr || user_stream->header_sent) {
-        // std::cout << "[xquic] send_h3_response: skipped (null=" << (user_stream == nullptr)
-                  // << " h3_req=" << (user_stream ? user_stream->h3_request : nullptr)
-                  // << " header_sent=" << (user_stream ? user_stream->header_sent : -1) << ")" << std::endl;
+    if (user_stream == nullptr || user_stream->h3_request == nullptr) {
         return;
     }
 
-    // std::cout << "[xquic] send_h3_response: sending headers + body" << std::endl;
+    xqc_h3_request_t *req = static_cast<xqc_h3_request_t*>(user_stream->h3_request);
 
-    xqc_http_header_t headers[] = {
+    // Send headers with content-length
+    char content_length_buf[32];
+    int cl_len = snprintf(content_length_buf, sizeof(content_length_buf), "%zu", user_stream->send_body_len);
+
+    xqc_http_header_t resp_headers[] = {
         {
             {.iov_base = const_cast<char*>(kH3StatusName), .iov_len = sizeof(kH3StatusName) - 1},
             {.iov_base = const_cast<char*>(kH3StatusValue), .iov_len = sizeof(kH3StatusValue) - 1},
-            0
-        },
-        {
-            {.iov_base = const_cast<char*>(kH3ContentLengthName), .iov_len = sizeof(kH3ContentLengthName) - 1},
-            {.iov_base = const_cast<char*>(kH3ContentLengthValue), .iov_len = sizeof(kH3ContentLengthValue) - 1},
             0
         },
         {
@@ -683,18 +689,32 @@ void XquicSeastarServer::send_h3_response(user_stream_t *user_stream) {
             {.iov_base = const_cast<char*>(kH3ContentTypeValue), .iov_len = sizeof(kH3ContentTypeValue) - 1},
             0
         },
+        {
+            {.iov_base = const_cast<char*>(kH3ContentLengthName), .iov_len = sizeof(kH3ContentLengthName) - 1},
+            {.iov_base = content_length_buf, .iov_len = static_cast<size_t>(cl_len)},
+            0
+        },
     };
     xqc_http_headers_t response_headers = {
-        .headers = headers,
-        .count = sizeof(headers) / sizeof(headers[0]),
+        .headers = resp_headers,
+        .count = sizeof(resp_headers) / sizeof(resp_headers[0]),
     };
-
+    xqc_h3_request_send_headers(req, &response_headers, 0);
     user_stream->header_sent = 1;
     _stats.h3_responses++;
-    xqc_h3_request_send_headers(reinterpret_cast<xqc_h3_request_t*>(user_stream->h3_request), &response_headers, 0);
-    xqc_h3_request_send_body(reinterpret_cast<xqc_h3_request_t*>(user_stream->h3_request),
-                             const_cast<unsigned char*>(kH3ResponseBody),
-                             sizeof(kH3ResponseBody) - 1, 1);
+
+    // Send body with FIN
+    if (user_stream->send_body && user_stream->send_body_len > 0) {
+        xqc_h3_request_send_body(req,
+            reinterpret_cast<unsigned char*>(user_stream->send_body),
+            user_stream->send_body_len, 1);
+        user_stream->total_sent += user_stream->send_body_len;
+        std::free(user_stream->send_body);
+        user_stream->send_body = nullptr;
+        user_stream->send_body_len = 0;
+    } else {
+        xqc_h3_request_send_body(req, nullptr, 0, 1);
+    }
 }
 
 int XquicSeastarServer::on_server_accept(xqc_engine_t *engine, xqc_connection_t *conn,
@@ -775,15 +795,14 @@ xqc_int_t XquicSeastarServer::on_stream_write_notify(xqc_stream_t *stream, void 
         return 0;
     }
 
-    // std::cout << "[xquic] stream_write_notify: offset=" << user_stream->send_offset
-              // << " total=" << user_stream->send_body_len << std::endl;
-
+    // Drain pending send buffer
     while (user_stream->send_offset < user_stream->send_body_len) {
         const size_t remaining = user_stream->send_body_len - user_stream->send_offset;
+        // In framed mode, set FIN on last byte; in echo mode, FIN is set per-chunk in read_notify
+        int fin_flag = _echo_mode ? 0 : 1;
         const ssize_t sent = xqc_stream_send(stream,
-            reinterpret_cast<unsigned char*>(user_stream->send_body + user_stream->send_offset), remaining, 1);
+            reinterpret_cast<unsigned char*>(user_stream->send_body + user_stream->send_offset), remaining, fin_flag);
         if (sent == -XQC_EAGAIN) {
-            // std::cout << "[xquic] stream_write_notify: EAGAIN" << std::endl;
             return 0;
         }
         if (sent < 0) {
@@ -793,8 +812,13 @@ xqc_int_t XquicSeastarServer::on_stream_write_notify(xqc_stream_t *stream, void 
 
         user_stream->send_offset += static_cast<size_t>(sent);
         user_stream->total_sent += static_cast<size_t>(sent);
-        // std::cout << "[xquic] stream_write_notify: sent=" << sent << " total_sent=" << user_stream->total_sent << std::endl;
     }
+
+    // Pending buffer fully drained, free it
+    std::free(user_stream->send_body);
+    user_stream->send_body = nullptr;
+    user_stream->send_body_len = 0;
+    user_stream->send_offset = 0;
 
     return 0;
 }
@@ -809,6 +833,7 @@ xqc_int_t XquicSeastarServer::on_stream_create_notify(xqc_stream_t *stream, void
         owned_stream->user_conn = static_cast<user_conn_t*>(xqc_get_conn_user_data_by_stream(stream));
         xqc_stream_set_user_data(stream, owned_stream.get());
         owned_stream.release();
+        _stats.streams_created++;
         return 0;
 
     } catch (const std::bad_alloc&) {
@@ -824,47 +849,109 @@ xqc_int_t XquicSeastarServer::on_stream_read_notify(xqc_stream_t *stream, void *
         return -1;
     }
 
-    // std::cout << "[xquic] stream_read_notify: stream_id=" << xqc_stream_id(stream) << std::endl;
-
-    unsigned char body[4096];
+    unsigned char body[65536];
     unsigned char fin = 0;
-    while (true) {
-        ssize_t read = xqc_stream_recv(stream, body, sizeof(body), &fin);
-        if (read == -XQC_EAGAIN || read == 0) {
-            break;
-        }
-        if (read < 0) {
-            std::cerr << "[xquic] stream_read_notify: recv error=" << read << std::endl;
-            return -1;
-        }
 
-        user_stream->total_recvd += static_cast<size_t>(read);
-        // std::cout << "[xquic] stream_read_notify: read=" << read << " total=" << user_stream->total_recvd
-                  // << " fin=" << (int)fin << std::endl;
-        if (!append_stream_payload(user_stream, body, static_cast<size_t>(read))) {
-            return -1;
+    if (_video_mode) {
+        // ── Video mode: accumulate data, parse video frame headers, write .h264 ──
+        while (true) {
+            ssize_t read = xqc_stream_recv(stream, body, sizeof(body), &fin);
+            if (read == -XQC_EAGAIN || read == 0) break;
+            if (read < 0) {
+                std::cerr << "[xquic] stream_read_notify(video): recv error=" << read << std::endl;
+                return -1;
+            }
+
+            append_stream_payload(user_stream, body, static_cast<size_t>(read));
+            user_stream->total_recvd += static_cast<size_t>(read);
+            _stats.video_bytes_recvd += static_cast<size_t>(read);
+
+            if (!process_video_frames(user_stream, _video_output_dir)) {
+                return -1;
+            }
+
+            if (fin) {
+                /* Flush any remaining buffered data */
+                process_video_frames(user_stream, _video_output_dir);
+                user_stream->recv_fin = 1;
+                _stats.video_streams_finished++;
+                std::cout << "[video] Stream finished, total_recvd="
+                          << user_stream->total_recvd << std::endl;
+            }
         }
-        if (fin) {
-            user_stream->recv_fin = 1;
+    } else if (_echo_mode) {
+        // ── Streaming echo: read chunks and immediately send them back ──
+        while (true) {
+            ssize_t read = xqc_stream_recv(stream, body, sizeof(body), &fin);
+            if (read == -XQC_EAGAIN || read == 0) {
+                break;
+            }
+            if (read < 0) {
+                std::cerr << "[xquic] stream_read_notify: recv error=" << read << std::endl;
+                return -1;
+            }
+
+            user_stream->total_recvd += static_cast<size_t>(read);
+
+            int send_fin = fin ? 1 : 0;
+            size_t offset = 0;
+            while (offset < static_cast<size_t>(read)) {
+                ssize_t sent = xqc_stream_send(stream,
+                    body + offset, static_cast<size_t>(read) - offset, send_fin);
+                if (sent == -XQC_EAGAIN) {
+                    size_t remaining = static_cast<size_t>(read) - offset;
+                    char *buf = static_cast<char*>(std::realloc(user_stream->send_body,
+                        user_stream->send_body_len + remaining));
+                    if (!buf) return -1;
+                    std::memcpy(buf + user_stream->send_body_len, body + offset, remaining);
+                    user_stream->send_body = buf;
+                    user_stream->send_body_len += remaining;
+                    goto done_reading;
+                }
+                if (sent < 0) {
+                    std::cerr << "[xquic] stream_read_notify: send error=" << sent << std::endl;
+                    return -1;
+                }
+                offset += static_cast<size_t>(sent);
+                user_stream->total_sent += static_cast<size_t>(sent);
+            }
+
+            if (fin) {
+                user_stream->recv_fin = 1;
+            }
+        }
+    } else {
+        // ── Framed protocol: accumulate full request, then build response ──
+        while (true) {
+            ssize_t read = xqc_stream_recv(stream, body, sizeof(body), &fin);
+            if (read == -XQC_EAGAIN || read == 0) {
+                break;
+            }
+            if (read < 0) {
+                std::cerr << "[xquic] stream_read_notify: recv error=" << read << std::endl;
+                return -1;
+            }
+
+            append_stream_payload(user_stream, body, static_cast<size_t>(read));
+            user_stream->total_recvd += static_cast<size_t>(read);
+
+            if (fin) {
+                user_stream->recv_fin = 1;
+                // Build framed response and trigger send
+                build_framed_response(stream, user_stream);
+                on_stream_write_notify(stream, user_data);
+            }
         }
     }
 
-    if (!user_stream->recv_fin) {
-        return 0;
-    }
-
-    // std::cout << "[xquic] stream_read_notify: FIN received, building response" << std::endl;
-    if (user_stream->send_body == nullptr && !build_transport_demo_response(stream, user_stream)) {
-        std::cerr << "[xquic] stream_read_notify: build_transport_demo_response failed" << std::endl;
-        return -1;
-    }
-
-    return on_stream_write_notify(stream, user_stream);
+done_reading:
+    return 0;
 }
 
 xqc_int_t XquicSeastarServer::on_stream_close_notify(xqc_stream_t *stream, void *user_data) {
     // std::cout << "[xquic] stream_close_notify: stream_id=" << xqc_stream_id(stream) << std::endl;
     (void)stream;
+    _stats.streams_closed++;
 
     auto user_stream = std::unique_ptr<user_stream_t>(static_cast<user_stream_t*>(user_data));
     release_user_stream(user_stream.get());
@@ -898,16 +985,19 @@ int XquicSeastarServer::on_h3_conn_close_notify(xqc_h3_conn_t *conn, const xqc_c
 }
 
 xqc_int_t XquicSeastarServer::on_h3_request_write_notify(xqc_h3_request_t *req, void *user_data) {
-    (void)req;
-    // std::cout << "[xquic] h3_request_write_notify" << std::endl;
-    send_h3_response(static_cast<user_stream_t*>(user_data));
+    if (!_echo_mode) {
+        // Framed mode: retry sending if previous send hit flow control
+        user_stream_t *user_stream = static_cast<user_stream_t*>(user_data);
+        if (user_stream && user_stream->send_body && user_stream->send_body_len > 0) {
+            send_h3_response(user_stream);
+        }
+    }
     return 0;
 }
 
 xqc_int_t XquicSeastarServer::on_h3_request_read_notify(xqc_h3_request_t *req,
                                                         xqc_request_notify_flag_t flag, void *user_data) {
     _stats.h3_requests++;
-    // std::cout << "[xquic] h3_request_read_notify: flag=0x" << std::hex << flag << std::dec << std::endl;
     user_stream_t *user_stream = static_cast<user_stream_t*>(user_data);
     if (user_stream == nullptr) {
         try {
@@ -926,12 +1016,36 @@ xqc_int_t XquicSeastarServer::on_h3_request_read_notify(xqc_h3_request_t *req,
 
     if (flag & XQC_REQ_NOTIFY_READ_HEADER) {
         XqcHeadersPtr headers(xqc_h3_request_recv_headers(req, nullptr), &std::free);
+
+        if (_echo_mode) {
+            // Streaming: send headers immediately (no content-length)
+            if (!user_stream->header_sent) {
+                xqc_http_header_t resp_headers[] = {
+                    {
+                        {.iov_base = const_cast<char*>(kH3StatusName), .iov_len = sizeof(kH3StatusName) - 1},
+                        {.iov_base = const_cast<char*>(kH3StatusValue), .iov_len = sizeof(kH3StatusValue) - 1},
+                        0
+                    },
+                    {
+                        {.iov_base = const_cast<char*>(kH3ContentTypeName), .iov_len = sizeof(kH3ContentTypeName) - 1},
+                        {.iov_base = const_cast<char*>(kH3ContentTypeValue), .iov_len = sizeof(kH3ContentTypeValue) - 1},
+                        0
+                    },
+                };
+                xqc_http_headers_t response_headers = {
+                    .headers = resp_headers,
+                    .count = sizeof(resp_headers) / sizeof(resp_headers[0]),
+                };
+                xqc_h3_request_send_headers(req, &response_headers, 0);
+                user_stream->header_sent = 1;
+                _stats.h3_responses++;
+            }
+        }
+        // Framed mode: headers will be sent in send_h3_response after body is accumulated
     }
 
-    bool should_respond = false;
-
     if (flag & XQC_REQ_NOTIFY_READ_BODY) {
-        unsigned char body[4096];
+        unsigned char body[65536];
         unsigned char fin = 0;
         while (true) {
             ssize_t read = xqc_h3_request_recv_body(req, body, sizeof(body), &fin);
@@ -939,19 +1053,34 @@ xqc_int_t XquicSeastarServer::on_h3_request_read_notify(xqc_h3_request_t *req,
                 break;
             }
             user_stream->total_recvd += static_cast<size_t>(read);
+
+            if (_echo_mode) {
+                // Streaming echo
+                xqc_h3_request_send_body(req, body, static_cast<size_t>(read), fin ? 1 : 0);
+                user_stream->total_sent += static_cast<size_t>(read);
+            } else {
+                // Framed: accumulate body
+                append_stream_payload(user_stream, body, static_cast<size_t>(read));
+            }
+
             if (fin) {
-                should_respond = true;
+                if (!_echo_mode) {
+                    // Build framed response and send
+                    build_framed_response(nullptr, user_stream);
+                    send_h3_response(user_stream);
+                }
                 break;
             }
         }
     }
 
     if (flag & XQC_REQ_NOTIFY_READ_EMPTY_FIN) {
-        should_respond = true;
-    }
-
-    if (should_respond) {
-        send_h3_response(user_stream);
+        if (_echo_mode) {
+            xqc_h3_request_send_body(req, nullptr, 0, 1);
+        } else {
+            build_framed_response(nullptr, user_stream);
+            send_h3_response(user_stream);
+        }
     }
 
     return 0;
@@ -1109,12 +1238,45 @@ xqc_int_t XquicSeastarServer::ss_h3_request_close_notify(xqc_h3_request_t *req, 
     return server == nullptr ? 0 : server->on_h3_request_close_notify(req, user_data);
 }
 
+void XquicSeastarServer::print_stats() {
+    auto &s = _stats;
+    auto &p = _stats_prev;
+
+    uint64_t d_bytes_recv = s.bytes_recv - p.bytes_recv;
+    uint64_t d_bytes_sent = s.bytes_sent - p.bytes_sent;
+    uint64_t d_pkts_recv = s.packets_recv - p.packets_recv;
+    uint64_t d_pkts_sent = s.packets_sent - p.packets_sent;
+    uint64_t active_conns = s.conns_accepted - s.conns_closed;
+    uint64_t active_streams = s.streams_created - s.streams_closed;
+
+    /* rates are per 2s interval, convert to per-second */
+    double recv_mbps = d_bytes_recv * 8.0 / 2.0 / 1e6;
+    double send_mbps = d_bytes_sent * 8.0 / 2.0 / 1e6;
+
+    std::cout << "[stats] conns=" << active_conns
+              << " streams=" << active_streams
+              << " total_accepted=" << s.conns_accepted
+              << " | recv=" << recv_mbps << "Mbps (" << d_pkts_recv/2 << "pps)"
+              << " send=" << send_mbps << "Mbps (" << d_pkts_sent/2 << "pps)";
+    if (_video_mode) {
+        uint64_t d_video = s.video_bytes_recvd - p.video_bytes_recvd;
+        std::cout << " | video=" << d_video/2/1024 << "KB/s"
+                  << " finished=" << s.video_streams_finished;
+    }
+    std::cout << std::endl;
+
+    _stats_prev = s;
+}
+
 int main(int argc, char **argv) {
     seastar::app_template app;
     app.add_options()
         ("port,p", bpo::value<uint16_t>()->default_value(8443), "UDP port")
         ("cert,c", bpo::value<std::string>()->default_value("./server.crt"), "TLS certificate path")
-        ("key,k", bpo::value<std::string>()->default_value("./server.key"), "TLS private key path");
+        ("key,k", bpo::value<std::string>()->default_value("./server.key"), "TLS private key path")
+        ("echo,e", bpo::bool_switch()->default_value(false), "Enable streaming echo mode (default: framed protocol)")
+        ("video,v", bpo::bool_switch()->default_value(false), "Enable video stream receiver mode")
+        ("video-dir", bpo::value<std::string>()->default_value("./video_out"), "Output directory for recorded .h264 files");
 
     return app.run_deprecated(argc, argv, [&app] {
         auto& config = app.configuration();
@@ -1122,7 +1284,10 @@ int main(int argc, char **argv) {
 
         return server->start(config["port"].as<uint16_t>(),
                              config["cert"].as<std::string>(),
-                             config["key"].as<std::string>())
+                             config["key"].as<std::string>(),
+                             config["echo"].as<bool>(),
+                             config["video"].as<bool>(),
+                             config["video-dir"].as<std::string>())
             .then([server = std::move(server)]() mutable {
                 // Keep the sample server alive until the Seastar app shuts down.
                 return seastar::keep_doing([] {

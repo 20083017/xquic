@@ -586,18 +586,19 @@ void XquicClient::on_conn_handshake_finished(xqc_connection_t *conn, void *user_
             u_stream->stream = stream;
             xqc_stream_set_user_data(stream, u_stream);
             
-            // Prepare send body
+            // Prepare send body and start sending
             if (send_body_size_ > 0) {
-                u_stream->send_body_max = 100*1024*1024; // Max limit
                 u_stream->send_body = (char*)malloc(send_body_size_);
                 if (u_stream->send_body) {
-                    memset(u_stream->send_body, 1, send_body_size_);
+                    memset(u_stream->send_body, 'A', send_body_size_);
                     u_stream->send_body_len = send_body_size_;
                 }
+                // Start sending via loop; write_notify will continue if EAGAIN
+                send_stream_data(stream, u_stream);
+            } else {
+                char data[] = "Hello Server";
+                xqc_stream_send(stream, (unsigned char*)data, strlen(data), 1);
             }
-            
-            char data[] = "Hello Server";
-            xqc_stream_send(stream, (unsigned char*)data, strlen(data), 1);
         }
     }
 }
@@ -658,24 +659,43 @@ xqc_int_t XquicClient::on_stream_read_notify(xqc_stream_t *stream, void *user_da
     user_stream_t *user_stream = (user_stream_t *)user_data;
     if (!user_stream) return 0;
 
-    unsigned char buf[4096];
+    unsigned char buf[65536];
     unsigned char fin = 0;
-    ssize_t read = xqc_stream_recv(stream, buf, sizeof(buf), &fin);
-    
-    if (read > 0) {
-        printf("client: stream read %zd bytes\n", read);
-        
-        // Handle receive logic (echo check, save file, etc.)
-        if (echo_check_ && user_stream->recv_body == NULL) {
-            user_stream->recv_body = (char*)malloc(user_stream->send_body_len);
+    while (true) {
+        ssize_t read = xqc_stream_recv(stream, buf, sizeof(buf), &fin);
+        if (read == -XQC_EAGAIN || read == 0) {
+            break;
         }
-        if (echo_check_ && user_stream->recv_body) {
-            if (user_stream->recv_body_len + read <= user_stream->send_body_len) {
-                memcpy(user_stream->recv_body + user_stream->recv_body_len, buf, read);
+        if (read < 0) {
+            printf("client: stream recv error=%zd\n", read);
+            return -1;
+        }
+
+        user_stream->total_recvd += read;
+
+        // Dynamically grow recv buffer
+        if (user_stream->recv_body == NULL) {
+            size_t init_cap = user_stream->send_body_len > 0 ? user_stream->send_body_len : 65536;
+            user_stream->recv_body = (char*)malloc(init_cap);
+            user_stream->recv_body_cap = init_cap;
+            user_stream->recv_body_len = 0;
+        }
+        if (user_stream->recv_body) {
+            // Grow if needed
+            while (user_stream->recv_body_len + read > user_stream->recv_body_cap) {
+                size_t new_cap = user_stream->recv_body_cap * 2;
+                char *new_buf = (char*)realloc(user_stream->recv_body, new_cap);
+                if (!new_buf) {
+                    printf("client: recv buffer realloc failed\n");
+                    return -1;
+                }
+                user_stream->recv_body = new_buf;
+                user_stream->recv_body_cap = new_cap;
             }
+            memcpy(user_stream->recv_body + user_stream->recv_body_len, buf, read);
+            user_stream->recv_body_len += read;
         }
-        user_stream->recv_body_len += read;
-        
+
         if (fin) {
             user_stream->recv_fin = 1;
             printf("client: stream finished. recv_len=%zu, send_len=%zu\n", 
@@ -688,6 +708,7 @@ xqc_int_t XquicClient::on_stream_read_notify(xqc_stream_t *stream, void *user_da
                     printf("====>Echo Check Failed\n");
                 }
             }
+            break;
         }
     }
     return 0;
@@ -729,35 +750,53 @@ xqc_int_t XquicClient::on_request_read_notify(xqc_h3_request_t *req, xqc_request
     }
 
     if (flag & XQC_REQ_NOTIFY_READ_BODY) {
-        unsigned char buf[4096];
+        unsigned char buf[65536];
         unsigned char fin = 0;
-        ssize_t read = xqc_h3_request_recv_body(req, buf, sizeof(buf), &fin);
-        if (read > 0) {
-            printf("client: h3 body read %zd bytes\n", read);
-            
+        while (true) {
+            ssize_t read = xqc_h3_request_recv_body(req, buf, sizeof(buf), &fin);
+            if (read <= 0) break;
+
+            user_stream->total_recvd += read;
+
+            // Dynamically grow recv buffer
+            if (user_stream->recv_body == NULL) {
+                size_t init_cap = user_stream->send_body_len > 0 ? user_stream->send_body_len : 65536;
+                user_stream->recv_body = (char*)malloc(init_cap);
+                user_stream->recv_body_cap = init_cap;
+                user_stream->recv_body_len = 0;
+            }
+            if (user_stream->recv_body) {
+                while (user_stream->recv_body_len + read > user_stream->recv_body_cap) {
+                    size_t new_cap = user_stream->recv_body_cap * 2;
+                    char *new_buf = (char*)realloc(user_stream->recv_body, new_cap);
+                    if (!new_buf) { return -1; }
+                    user_stream->recv_body = new_buf;
+                    user_stream->recv_body_cap = new_cap;
+                }
+                memcpy(user_stream->recv_body + user_stream->recv_body_len, buf, read);
+                user_stream->recv_body_len += read;
+            }
+
             // Save to file if requested
             if (save_file_ && user_stream->recv_body_fp == NULL) {
                 user_stream->recv_body_fp = fopen(write_file_.c_str(), "wb");
             }
             if (save_file_ && user_stream->recv_body_fp) {
                 fwrite(buf, 1, read, user_stream->recv_body_fp);
-                fflush(user_stream->recv_body_fp);
             }
 
-            // Echo check
-            if (echo_check_ && user_stream->recv_body) {
-                 if (user_stream->recv_body_len + read <= user_stream->send_body_len) {
-                    memcpy(user_stream->recv_body + user_stream->recv_body_len, buf, read);
-                 }
+            if (fin) {
+                user_stream->recv_fin = 1;
+                break;
             }
-            user_stream->recv_body_len += read;
         }
-        if (fin) {
-            user_stream->recv_fin = 1;
+
+        if (user_stream->recv_fin) {
             printf("client: request finished. recv_len=%zu, send_len=%zu\n", 
                    user_stream->recv_body_len, user_stream->send_body_len);
             
-            if (echo_check_ && user_stream->recv_body_len == user_stream->send_body_len) {
+            if (echo_check_ && user_stream->recv_body_len == user_stream->send_body_len
+                && user_stream->recv_body && user_stream->send_body) {
                 if (memcmp(user_stream->send_body, user_stream->recv_body, user_stream->send_body_len) == 0) {
                     printf("====>Echo Check Success\n");
                 } else {
@@ -789,18 +828,24 @@ xqc_int_t XquicClient::on_request_close_notify(xqc_h3_request_t *req, void *user
 void XquicClient::send_stream_data(xqc_stream_t *stream, user_stream_t *user_stream) {
     if (!user_stream || !stream) return;
     
-    if (user_stream->send_offset < user_stream->send_body_len) {
+    while (user_stream->send_offset < user_stream->send_body_len) {
         size_t remaining = user_stream->send_body_len - user_stream->send_offset;
-        size_t to_send = remaining < 4096 ? remaining : 4096;
+        int fin = 1; // always set FIN, xquic will only apply it on the last byte
         
         ssize_t sent = xqc_stream_send(stream, 
                                        (unsigned char*)(user_stream->send_body + user_stream->send_offset), 
-                                       to_send, 
-                                       (to_send == remaining) ? 1 : 0); // Set FIN if last chunk
+                                       remaining, fin);
         
-        if (sent > 0) {
-            user_stream->send_offset += sent;
+        if (sent == -XQC_EAGAIN) {
+            // Flow control or congestion, will be called again via write_notify
+            break;
         }
+        if (sent < 0) {
+            printf("client: send_stream_data error=%zd\n", sent);
+            break;
+        }
+        user_stream->send_offset += sent;
+        user_stream->total_sent += sent;
     }
 }
 
@@ -816,10 +861,9 @@ void XquicClient::send_request(user_conn_t *u_conn) {
     
     // Prepare send body
     if (send_body_size_ > 0) {
-        user_stream->send_body_max = 100*1024*1024; // Max limit
         user_stream->send_body = (char*)malloc(send_body_size_);
         if (user_stream->send_body) {
-            memset(user_stream->send_body, 1, send_body_size_);
+            memset(user_stream->send_body, 'A', send_body_size_);
             user_stream->send_body_len = send_body_size_;
         }
     }

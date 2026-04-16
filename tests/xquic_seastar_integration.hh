@@ -60,11 +60,8 @@ public:
             return _queue.empty();
         }, [this, &udp_channel] {
             XquicSeastarSendQueue::Datagram datagram = _queue.pop();
-            seastar::temporary_buffer<char> buffer(datagram.payload.size());
-            if (!datagram.payload.empty()) {
-                std::memcpy(buffer.get_write(), datagram.payload.data(), datagram.payload.size());
-            }
-            return udp_channel.send(datagram.peer, seastar::net::packet(std::move(buffer)));
+            // Zero-copy: temporary_buffer moves directly into packet
+            return udp_channel.send(datagram.peer, seastar::net::packet(std::move(datagram.payload)));
         });
     }
 

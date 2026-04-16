@@ -9,16 +9,20 @@
 #include <seastar/net/api.hh>
 #include <xquic/xqc_http3.h>
 #include <xquic/xquic.h>
+#include <xquic/xqc_video_frame.h>
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <unordered_map>
 
 class XquicSeastarServer {
 public:
     XquicSeastarServer();
     ~XquicSeastarServer();
 
-    seastar::future<> start(uint16_t port, const std::string& cert_path, const std::string& key_path);
+    seastar::future<> start(uint16_t port, const std::string& cert_path, const std::string& key_path,
+                            bool echo_mode = false, bool video_mode = false,
+                            const std::string& video_output_dir = "./video_out");
     seastar::future<> stop();
 
 private:
@@ -34,17 +38,24 @@ private:
     uint16_t _port;
     bool _stopping;
     bool _send_flush_in_progress;
+    bool _echo_mode;  // true: streaming echo, false: framed protocol
+    bool _video_mode; // true: video stream receiver (write .h264 files)
+    std::string _video_output_dir; // directory for saved .h264 files
 
     // Statistics for benchmarking
     struct Stats {
         uint64_t conns_accepted = 0;
         uint64_t conns_closed = 0;
+        uint64_t streams_created = 0;
+        uint64_t streams_closed = 0;
         uint64_t h3_requests = 0;
         uint64_t h3_responses = 0;
         uint64_t packets_recv = 0;
         uint64_t packets_sent = 0;
         uint64_t bytes_recv = 0;
         uint64_t bytes_sent = 0;
+        uint64_t video_bytes_recvd = 0;
+        uint64_t video_streams_finished = 0;
     } _stats;
     seastar::timer<> _stats_timer;
     Stats _stats_prev;

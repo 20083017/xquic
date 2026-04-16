@@ -77,6 +77,20 @@ endif()
 target_link_libraries(test_server ${APP_DEPEND_LIBS})
 target_link_libraries(test_client ${APP_DEPEND_LIBS})
 
+# Video streaming client
+set(VIDEO_CLIENT_SOURCES
+    xqc_video_client.cpp
+)
+add_executable(video_client ${VIDEO_CLIENT_SOURCES})
+target_link_libraries(video_client ${APP_DEPEND_LIBS})
+
+# Video streaming benchmark client
+set(VIDEO_BENCH_SOURCES
+    xqc_video_bench.cpp
+)
+add_executable(video_bench ${VIDEO_BENCH_SOURCES})
+target_link_libraries(video_bench ${APP_DEPEND_LIBS})
+
 if(XQC_ENABLE_SEASTAR_EXAMPLE)
     # When XQC_ENABLE_SEASTAR is ON, Seastar is built from submodule
     # (third_party/seastar) and provides the Seastar::seastar target.
