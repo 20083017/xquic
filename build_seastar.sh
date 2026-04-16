@@ -1,5 +1,5 @@
 #!/bin/bash
-# build_seastar.sh — 使用 submodule 方式构建 xquic + seastar 集成
+# build_seastar.sh — 使用 submodule 方式构建 xquic + seastar 集成 (quictls)
 #
 # 用法:
 #   ./build_seastar.sh          # 默认构建
@@ -10,7 +10,8 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUILD_DIR="${SCRIPT_DIR}/build_seastar"
-BORINGSSL_DIR="${SCRIPT_DIR}/third_party/boringssl"
+QUICTLS_SRC="${SCRIPT_DIR}/third_party/quictls"
+QUICTLS_INSTALL="${QUICTLS_SRC}/build"
 SEASTAR_DIR="${SCRIPT_DIR}/third_party/seastar"
 NPROC=$(nproc 2>/dev/null || echo 4)
 
@@ -59,40 +60,46 @@ check_submodules() {
         cd "${SCRIPT_DIR}"
         git submodule update --init --recursive third_party/seastar
     fi
-
-    if [ ! -f "${BORINGSSL_DIR}/CMakeLists.txt" ]; then
-        error "BoringSSL 未找到: ${BORINGSSL_DIR}"
-        error "请确保 third_party/boringssl 存在"
-        exit 1
-    fi
 }
 
-build_boringssl() {
-    if [ -f "${BORINGSSL_DIR}/build/ssl/libssl.a" ] && [ -f "${BORINGSSL_DIR}/build/crypto/libcrypto.a" ]; then
-        info "BoringSSL 已构建，跳过"
+build_quictls() {
+    if [ -f "${QUICTLS_INSTALL}/lib64/libssl.a" ] && [ -f "${QUICTLS_INSTALL}/lib64/libcrypto.a" ]; then
+        info "quictls 已构建，跳过"
         return
     fi
 
-    info "构建 BoringSSL..."
-    mkdir -p "${BORINGSSL_DIR}/build"
-    cd "${BORINGSSL_DIR}/build"
-    cmake -GNinja ..
-    ninja ssl crypto
-    info "BoringSSL 构建完成"
+    if [ ! -d "${QUICTLS_SRC}" ]; then
+        info "克隆 quictls..."
+        git clone --depth 1 --branch openssl-3.1.4+quic \
+            https://github.com/quictls/openssl.git "${QUICTLS_SRC}"
+    fi
+
+    info "构建 quictls..."
+    cd "${QUICTLS_SRC}"
+    ./Configure --prefix="${QUICTLS_INSTALL}" --openssldir="${QUICTLS_INSTALL}" \
+        no-shared no-tests no-docs
+    make -j"${NPROC}"
+    make install_sw
+    info "quictls 构建完成: ${QUICTLS_INSTALL}"
 }
 
 build_xquic_seastar() {
-    info "配置 xquic + Seastar 构建..."
+    info "配置 xquic + Seastar 构建 (quictls)..."
     mkdir -p "${BUILD_DIR}"
     cd "${BUILD_DIR}"
+
+    # Boost 1.83 installed in /usr/local
+    local BOOST_ROOT="/usr/local"
 
     cmake -S "${SCRIPT_DIR}" -B "${BUILD_DIR}" \
         -DXQC_ENABLE_SEASTAR=ON \
         -DXQC_ENABLE_TESTING=ON \
-        -DSSL_TYPE=boringssl \
-        -DSSL_PATH="${BORINGSSL_DIR}" \
-        -DSSL_INC_PATH="${BORINGSSL_DIR}/include" \
-        -DSSL_LIB_PATH="${BORINGSSL_DIR}/build/ssl/libssl.a;${BORINGSSL_DIR}/build/crypto/libcrypto.a"
+        -DSSL_TYPE=openssl \
+        -DSSL_PATH="${QUICTLS_INSTALL}" \
+        -DSSL_INC_PATH="${QUICTLS_INSTALL}/include" \
+        -DSSL_LIB_PATH="${QUICTLS_INSTALL}/lib64/libssl.a;${QUICTLS_INSTALL}/lib64/libcrypto.a" \
+        -DBOOST_ROOT="${BOOST_ROOT}" \
+        -DBoost_NO_SYSTEM_PATHS=ON
 
     info "编译 xquic_server_seastar (${NPROC} 并行)..."
     cmake --build "${BUILD_DIR}" --target xquic_server_seastar -j"${NPROC}"
@@ -115,12 +122,12 @@ case "${1:-build}" in
         info "清理构建目录: ${BUILD_DIR}"
         rm -rf "${BUILD_DIR}"
         check_submodules
-        build_boringssl
+        build_quictls
         build_xquic_seastar
         ;;
     build|"")
         check_submodules
-        build_boringssl
+        build_quictls
         build_xquic_seastar
         ;;
     *)

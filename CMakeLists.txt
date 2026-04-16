@@ -228,10 +228,9 @@ if(XQC_ENABLE_SEASTAR)
 endif()
 
 
-add_subdirectory(tests)
 # testing
 if(XQC_ENABLE_TESTING)
-    add_subdirectory(tests)
+    add_subdirectory(tests ${CMAKE_CURRENT_BINARY_DIR}/xquic_tests)
     add_subdirectory(demo)
     add_subdirectory(mini)
 endif(XQC_ENABLE_TESTING)
