@@ -7,11 +7,9 @@
 
 #include <algorithm>
 #include <seastar/core/app-template.hh>
-#include <seastar/core/sharded.hh>
 #include <seastar/core/loop.hh>
 #include <seastar/core/reactor.hh>
 #include <seastar/core/sleep.hh>
-#include <seastar/core/smp.hh>
 
 #include <boost/program_options.hpp>
 
@@ -369,7 +367,6 @@ void XquicSeastarServer::init_xquic_engine() {
         throw std::runtime_error("xqc_engine_get_default_config failed");
     }
     config.cfg_log_level = XQC_LOG_DEBUG;
-    config.cid_negotiate = 1; /* enable CID negotiation so our cid_generate_cb is used */
 
     xqc_engine_ssl_config_t ssl_config;
     std::memset(&ssl_config, 0, sizeof(ssl_config));
@@ -381,7 +378,6 @@ void XquicSeastarServer::init_xquic_engine() {
     xqc_engine_callback_t engine_cb;
     std::memset(&engine_cb, 0, sizeof(engine_cb));
     engine_cb.set_event_timer = XquicSeastarServer::ss_set_event_timer;
-    engine_cb.cid_generate_cb = XquicSeastarServer::ss_cid_generate;
     engine_cb.log_callbacks.xqc_log_write_err = [](xqc_log_level_t lvl, const void *buf, size_t size, void *) {
         (void)lvl;
         std::fwrite(buf, 1, size, stderr);
@@ -424,7 +420,7 @@ void XquicSeastarServer::init_xquic_engine() {
     }
 }
 
-seastar::future<> XquicSeastarServer::start_service(uint16_t port, const std::string& cert_path, const std::string& key_path,
+seastar::future<> XquicSeastarServer::start(uint16_t port, const std::string& cert_path, const std::string& key_path,
                                             bool echo_mode, bool video_mode, const std::string& video_output_dir) {
     _echo_mode = echo_mode;
     _video_mode = video_mode;
@@ -439,35 +435,26 @@ seastar::future<> XquicSeastarServer::start_service(uint16_t port, const std::st
 
         init_xquic_engine();
 
-        /*
-         * Only shard 0 opens the bound UDP socket for recv + send.
-         * Non-shard-0 sends go through smp::submit_to(0) to ensure
-         * correct source port (Seastar POSIX stack lacks SO_REUSEPORT).
-         */
-        if (seastar::this_shard_id() == 0) {
-            seastar::socket_address bind_addr = seastar::make_ipv4_address(seastar::ipv4_addr(port));
-            _udp_channel.emplace(seastar::engine().net().make_bound_datagram_channel(bind_addr));
+        seastar::socket_address bind_addr = seastar::make_ipv4_address(seastar::ipv4_addr(port));
+        _udp_channel.emplace(seastar::engine().net().make_bound_datagram_channel(bind_addr));
 
-            _receive_loop.emplace(
-                seastar::with_gate(_background_ops, [this] {
-                    return run_receive_loop();
-                }).handle_exception([this](std::exception_ptr ep) {
-                    if (_stopping) {
-                        return seastar::make_ready_future<>();
-                    }
-                    return seastar::make_exception_future<>(ep);
-                })
-            );
-        }
+        _receive_loop.emplace(
+            seastar::with_gate(_background_ops, [this] {
+                return run_receive_loop();
+            }).handle_exception([this](std::exception_ptr ep) {
+                if (_stopping) {
+                    return seastar::make_ready_future<>();
+                }
+                return seastar::make_exception_future<>(ep);
+            })
+        );
 
-        /* Start periodic stats printer (every 2 seconds) — all shards */
+        /* Start periodic stats printer (every 2 seconds) */
         _stats_prev = {};
         _stats_timer.set_callback([this] { print_stats(); });
         _stats_timer.arm_periodic(std::chrono::seconds(2));
 
-        std::cout << "[shard " << seastar::this_shard_id() << "] XQUIC engine initialized"
-                  << (seastar::this_shard_id() == 0 ? " (UDP listener on port " + std::to_string(_port) + ")" : "")
-                  << std::endl;
+        std::cout << "Seastar XQUIC server listening on UDP port " << _port << std::endl;
         return seastar::make_ready_future<>();
 
     } catch (...) {
@@ -585,101 +572,25 @@ void XquicSeastarServer::on_datagram(seastar::net::udp_datagram& datagram) {
     seastar::net::packet& packet = datagram.get_data();
     _stats.packets_recv++;
     _stats.bytes_recv += packet.len();
-
-    unsigned shard_count = seastar::smp::count;
+    // std::cout << "[xquic] recv " << packet.len() << " bytes from "
+              // << datagram.get_src() << std::endl;
 
     for (auto& frag : packet.fragments()) {
-        const unsigned char *data = reinterpret_cast<const unsigned char*>(frag.base);
-        size_t len = frag.size;
-
-        if (shard_count > 1) {
-            /* Route to correct shard based on DCID */
-            unsigned target = route_packet_to_shard(data, len);
-            if (target != 0) {
-                /* Copy data and dispatch to target shard */
-                _stats.packets_routed++;
-                auto buf = seastar::temporary_buffer<char>(frag.base, len);
-                auto pa = peer_addr;
-                auto pl = peer_len;
-                auto la = local_addr;
-                auto ll = local_len;
-                (void)seastar::smp::submit_to(target, [this, buf = std::move(buf), pa, pl, la, ll]() mutable {
-                    auto &local = _distributed->local();
-                    local.deliver_packet(std::move(buf), pa, pl, la, ll);
-                });
-                continue;
-            }
-        }
-
-        /* Process locally on shard 0 */
-        process_packet_local(data, len, peer_addr, peer_len, local_addr, local_len);
+        xqc_int_t rc = xqc_engine_packet_process(_engine,
+                                  reinterpret_cast<const unsigned char*>(frag.base),
+                                  frag.size,
+                                  reinterpret_cast<struct sockaddr*>(&local_addr),
+                                  local_len,
+                                  reinterpret_cast<struct sockaddr*>(&peer_addr),
+                                  peer_len,
+                                  xqc_now_us(),
+                                  &_packet_user_conn);
+        // std::cout << "[xquic] packet_process rc=" << rc << " frag_size=" << frag.size << std::endl;
     }
 
     xqc_engine_finish_recv(_engine);
+    // std::cout << "[xquic] finish_recv done, send_queue_empty=" << _send_integration.empty() << std::endl;
     schedule_send_flush();
-}
-
-unsigned XquicSeastarServer::route_packet_to_shard(const unsigned char *data, size_t len) {
-    unsigned shard_count = seastar::smp::count;
-    if (shard_count <= 1 || len == 0) return 0;
-
-    /*
-     * QUIC packet header:
-     *   bit 7 of byte 0: 1 = Long Header (Initial/Handshake), 0 = Short Header (1-RTT)
-     *
-     * For Short Header (1-RTT) packets, DCID starts at byte 1.
-     * We embedded shard_id in CID[0] via cid_generate_cb.
-     *
-     * For Long Header (Initial) packets, parse DCID to get shard routing.
-     * If it's a truly new connection (client-generated random DCID), it will
-     * land on a pseudo-random shard, and after handshake, the server will
-     * generate a new CID with the correct shard_id embedded.
-     */
-    xqc_cid_t dcid, scid;
-    std::memset(&dcid, 0, sizeof(dcid));
-    std::memset(&scid, 0, sizeof(scid));
-
-    /* Use default CID length = 8 (matches xquic internal default) */
-    xqc_int_t rc = xqc_packet_parse_cid(&dcid, &scid, 8, data, len);
-    if (rc == XQC_OK && dcid.cid_len > 0) {
-        return dcid.cid_buf[0] % shard_count;
-    }
-
-    /* Can't parse — handle on shard 0 */
-    return 0;
-}
-
-void XquicSeastarServer::process_packet_local(const unsigned char *data, size_t len,
-                                              struct sockaddr_storage& peer_addr, socklen_t peer_len,
-                                              struct sockaddr_storage& local_addr, socklen_t local_len) {
-    xqc_int_t rc = xqc_engine_packet_process(_engine, data, len,
-                              reinterpret_cast<struct sockaddr*>(&local_addr), local_len,
-                              reinterpret_cast<struct sockaddr*>(&peer_addr), peer_len,
-                              xqc_now_us(), &_packet_user_conn);
-    (void)rc;
-}
-
-void XquicSeastarServer::deliver_packet(seastar::temporary_buffer<char> data,
-                                        struct sockaddr_storage peer_addr, socklen_t peer_len,
-                                        struct sockaddr_storage local_addr, socklen_t local_len) {
-    if (_engine == nullptr || _stopping) return;
-
-    _stats.packets_recv++;
-    _stats.bytes_recv += data.size();
-
-    xqc_engine_packet_process(_engine,
-                              reinterpret_cast<const unsigned char*>(data.get()), data.size(),
-                              reinterpret_cast<struct sockaddr*>(&local_addr), local_len,
-                              reinterpret_cast<struct sockaddr*>(&peer_addr), peer_len,
-                              xqc_now_us(), &_packet_user_conn);
-    xqc_engine_finish_recv(_engine);
-    schedule_send_flush();
-}
-
-seastar::future<> XquicSeastarServer::send_datagram_on_shard0(seastar::temporary_buffer<char> data,
-                                                               seastar::socket_address dest) {
-    if (!_udp_channel || _stopping) return seastar::make_ready_future<>();
-    return _udp_channel->send(dest, std::move(data));
 }
 
 void XquicSeastarServer::on_engine_timer_expire() {
@@ -692,51 +603,17 @@ void XquicSeastarServer::on_engine_timer_expire() {
 
 ssize_t XquicSeastarServer::enqueue_send(const unsigned char *buf, size_t size,
                                          const struct sockaddr *peer_addr, socklen_t peer_addrlen) {
-    if (_stopping) {
-        errno = ESHUTDOWN;
-        return -1;
-    }
-
-    unsigned my_shard = seastar::this_shard_id();
-
-    if (my_shard != 0) {
-        /*
-         * Non-shard-0: copy data and submit send to shard 0.
-         * This ensures correct source port (only shard 0 has the bound socket).
-         * Seastar POSIX stack doesn't support SO_REUSEPORT.
-         */
-        auto data = seastar::temporary_buffer<char>(size);
-        std::memcpy(data.get_write(), buf, size);
-
-        seastar::socket_address dest;
-        if (peer_addr->sa_family == AF_INET && peer_addrlen >= sizeof(sockaddr_in)) {
-            const auto *a4 = reinterpret_cast<const sockaddr_in*>(peer_addr);
-            dest = seastar::socket_address(*a4);
-        } else if (peer_addr->sa_family == AF_INET6 && peer_addrlen >= sizeof(sockaddr_in6)) {
-            const auto *a6 = reinterpret_cast<const sockaddr_in6*>(peer_addr);
-            dest = seastar::socket_address(*a6);
-        } else {
-            errno = EINVAL;
-            return -1;
-        }
-
-        (void)seastar::smp::submit_to(0, [this, data = std::move(data), dest]() mutable {
-            return _distributed->local().send_datagram_on_shard0(std::move(data), dest);
-        });
-
-        _stats.packets_sent++;
-        _stats.bytes_sent += size;
-        return static_cast<ssize_t>(size);
-    }
-
-    /* Shard 0: use local send queue */
-    if (!_udp_channel) {
+    if (_stopping || !_udp_channel) {
+        std::cerr << "[xquic] enqueue_send: stopping or no channel" << std::endl;
         errno = ESHUTDOWN;
         return -1;
     }
 
     ssize_t queued = _send_integration.enqueue_write(buf, size, peer_addr, peer_addrlen);
+    // std::cout << "[xquic] enqueue_send: size=" << size << " queued=" << queued
+              // << " queue_empty=" << _send_integration.empty() << std::endl;
     if (queued < 0) {
+        std::cerr << "[xquic] enqueue_send: enqueue_write failed" << std::endl;
         return -1;
     }
 
@@ -1217,25 +1094,6 @@ xqc_int_t XquicSeastarServer::on_h3_request_close_notify(xqc_h3_request_t *req, 
     return 0;
 }
 
-ssize_t XquicSeastarServer::ss_cid_generate(const xqc_cid_t *ori_cid, uint8_t *cid_buf,
-                                             size_t cid_buflen, void *engine_user_data) {
-    auto *server = static_cast<XquicSeastarServer*>(engine_user_data);
-    (void)ori_cid;
-
-    if (cid_buflen < 1) return -1;
-
-    /*
-     * Embed shard_id in cid_buf[0] so that route_packet_to_shard() can
-     * do O(1) dispatch: target_shard = cid_buf[0] % shard_count.
-     *
-     * We write shard_id into byte 0; xquic fills the rest with random bytes
-     * (since we return 1 < cid_buflen).
-     */
-    unsigned shard_id = seastar::this_shard_id();
-    cid_buf[0] = static_cast<uint8_t>(shard_id);
-    return 1; /* wrote 1 byte; xquic fills remaining with random */
-}
-
 void XquicSeastarServer::ss_set_event_timer(xqc_msec_t wake_after, void *user_data) {
     auto* server = static_cast<XquicSeastarServer*>(user_data);
     if (server == nullptr) {
@@ -1395,14 +1253,11 @@ void XquicSeastarServer::print_stats() {
     double recv_mbps = d_bytes_recv * 8.0 / 2.0 / 1e6;
     double send_mbps = d_bytes_sent * 8.0 / 2.0 / 1e6;
 
-    std::cout << "[shard " << seastar::this_shard_id() << "] conns=" << active_conns
+    std::cout << "[stats] conns=" << active_conns
               << " streams=" << active_streams
               << " total_accepted=" << s.conns_accepted
               << " | recv=" << recv_mbps << "Mbps (" << d_pkts_recv/2 << "pps)"
               << " send=" << send_mbps << "Mbps (" << d_pkts_sent/2 << "pps)";
-    if (seastar::this_shard_id() == 0 && s.packets_routed > p.packets_routed) {
-        std::cout << " routed=" << (s.packets_routed - p.packets_routed)/2 << "/s";
-    }
     if (_video_mode) {
         uint64_t d_video = s.video_bytes_recvd - p.video_bytes_recvd;
         std::cout << " | video=" << d_video/2/1024 << "KB/s"
@@ -1417,36 +1272,30 @@ int main(int argc, char **argv) {
     seastar::app_template app;
     app.add_options()
         ("port,p", bpo::value<uint16_t>()->default_value(8443), "UDP port")
-        ("cert", bpo::value<std::string>()->default_value("./server.crt"), "TLS certificate path")
-        ("key", bpo::value<std::string>()->default_value("./server.key"), "TLS private key path")
+        ("cert,c", bpo::value<std::string>()->default_value("./server.crt"), "TLS certificate path")
+        ("key,k", bpo::value<std::string>()->default_value("./server.key"), "TLS private key path")
         ("echo,e", bpo::bool_switch()->default_value(false), "Enable streaming echo mode (default: framed protocol)")
         ("video,v", bpo::bool_switch()->default_value(false), "Enable video stream receiver mode")
         ("video-dir", bpo::value<std::string>()->default_value("./video_out"), "Output directory for recorded .h264 files");
 
     return app.run_deprecated(argc, argv, [&app] {
         auto& config = app.configuration();
-        auto port = config["port"].as<uint16_t>();
-        auto cert = config["cert"].as<std::string>();
-        auto key = config["key"].as<std::string>();
-        auto echo = config["echo"].as<bool>();
-        auto video = config["video"].as<bool>();
-        auto vdir = config["video-dir"].as<std::string>();
+        auto server = std::make_unique<XquicSeastarServer>();
 
-        static seastar::sharded<XquicSeastarServer> server;
-
-        return server.start().then([port, cert, key, echo, video, vdir] {
-            /* Start the QUIC engine on every shard */
-            return server.invoke_on_all([port, cert, key, echo, video, vdir](XquicSeastarServer &s) {
-                s.set_distributed(&server);
-                return s.start_service(port, cert, key, echo, video, vdir);
+        return server->start(config["port"].as<uint16_t>(),
+                             config["cert"].as<std::string>(),
+                             config["key"].as<std::string>(),
+                             config["echo"].as<bool>(),
+                             config["video"].as<bool>(),
+                             config["video-dir"].as<std::string>())
+            .then([server = std::move(server)]() mutable {
+                // Keep the sample server alive until the Seastar app shuts down.
+                return seastar::keep_doing([] {
+                        return seastar::sleep(std::chrono::hours(24));
+                    })
+                    .finally([server = std::move(server)]() mutable {
+                        return server->stop();
+                    });
             });
-        }).then([] {
-            std::cout << "Seastar XQUIC server ready (" << seastar::smp::count << " shards)" << std::endl;
-            return seastar::keep_doing([] {
-                return seastar::sleep(std::chrono::hours(24));
-            });
-        }).finally([] {
-            return server.stop();
-        });
     });
 }

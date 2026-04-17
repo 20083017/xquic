@@ -3,10 +3,8 @@
 #include "user_conn.h"
 #include "xquic_seastar_integration.hh"
 
-#include <seastar/core/distributed.hh>
 #include <seastar/core/future.hh>
 #include <seastar/core/gate.hh>
-#include <seastar/core/sharded.hh>
 #include <seastar/core/timer.hh>
 #include <seastar/net/api.hh>
 #include <xquic/xqc_http3.h>
@@ -17,41 +15,18 @@
 #include <string>
 #include <unordered_map>
 
-/**
- * Multi-core Seastar QUIC server using seastar::distributed<>.
- *
- * Architecture:
- *   Shard 0: [UDP recv] → parse DCID → hash(CID[0]) → submit_to(shard N)
- *   Shard N: independent xqc_engine, processes packets, enqueues responses
- *            → sends responses directly via per-shard unbound UDP socket
- *
- * CID routing: cid_generate_cb embeds shard_id in CID[0] for O(1) dispatch.
- * Initial packets (unknown CID / long header) are handled by shard 0.
- */
 class XquicSeastarServer {
 public:
     XquicSeastarServer();
     ~XquicSeastarServer();
 
-    /* Called by seastar::distributed<>::start() on each shard */
-    seastar::future<> start_service(uint16_t port, const std::string& cert_path, const std::string& key_path,
-                                    bool echo_mode, bool video_mode, const std::string& video_output_dir);
+    seastar::future<> start(uint16_t port, const std::string& cert_path, const std::string& key_path,
+                            bool echo_mode = false, bool video_mode = false,
+                            const std::string& video_output_dir = "./video_out");
     seastar::future<> stop();
 
-    /* Set the distributed<> back-pointer (called once on each shard after start) */
-    void set_distributed(seastar::distributed<XquicSeastarServer> *dist) { _distributed = dist; }
-
-    /* Cross-shard packet delivery: invoked on target shard via submit_to */
-    void deliver_packet(seastar::temporary_buffer<char> data,
-                        struct sockaddr_storage peer_addr, socklen_t peer_len,
-                        struct sockaddr_storage local_addr, socklen_t local_len);
-
-    /* Cross-shard UDP send: invoked on shard 0 by other shards */
-    seastar::future<> send_datagram_on_shard0(seastar::temporary_buffer<char> data,
-                                               seastar::socket_address dest);
-
 private:
-    std::optional<seastar::net::udp_channel> _udp_channel;  /* shard 0 only: bound, for recv + send */
+    std::optional<seastar::net::udp_channel> _udp_channel;
     std::optional<seastar::future<>> _receive_loop;
     seastar::gate _background_ops;
     seastar::timer<> _engine_timer;
@@ -63,10 +38,9 @@ private:
     uint16_t _port;
     bool _stopping;
     bool _send_flush_in_progress;
-    bool _echo_mode;
-    bool _video_mode;
-    std::string _video_output_dir;
-    seastar::distributed<XquicSeastarServer> *_distributed = nullptr;
+    bool _echo_mode;  // true: streaming echo, false: framed protocol
+    bool _video_mode; // true: video stream receiver (write .h264 files)
+    std::string _video_output_dir; // directory for saved .h264 files
 
     // Statistics for benchmarking
     struct Stats {
@@ -82,7 +56,6 @@ private:
         uint64_t bytes_sent = 0;
         uint64_t video_bytes_recvd = 0;
         uint64_t video_streams_finished = 0;
-        uint64_t packets_routed = 0;
     } _stats;
     seastar::timer<> _stats_timer;
     Stats _stats_prev;
@@ -91,10 +64,6 @@ private:
     void init_xquic_engine();
     seastar::future<> run_receive_loop();
     void on_datagram(seastar::net::udp_datagram& datagram);
-    void process_packet_local(const unsigned char *data, size_t len,
-                              struct sockaddr_storage& peer_addr, socklen_t peer_len,
-                              struct sockaddr_storage& local_addr, socklen_t local_len);
-    unsigned route_packet_to_shard(const unsigned char *data, size_t len);
     void on_engine_timer_expire();
     ssize_t enqueue_send(const unsigned char *buf, size_t size,
                          const struct sockaddr *peer_addr, socklen_t peer_addrlen);
@@ -119,8 +88,6 @@ private:
     xqc_int_t on_h3_request_read_notify(xqc_h3_request_t *req, xqc_request_notify_flag_t flag, void *user_data);
     xqc_int_t on_h3_request_close_notify(xqc_h3_request_t *req, void *user_data);
 
-    static ssize_t ss_cid_generate(const xqc_cid_t *ori_cid, uint8_t *cid_buf,
-                                   size_t cid_buflen, void *engine_user_data);
     static void ss_set_event_timer(xqc_msec_t wake_after, void *user_data);
     static ssize_t ss_write_socket(const unsigned char *buf, size_t size,
                                    const struct sockaddr *peer_addr, socklen_t peer_addrlen,
