@@ -84,6 +84,7 @@ private:
     size_t send_body_size_;
     int echo_check_;
     int save_file_;
+    int close_after_request_;
     std::string write_file_;
 };
 

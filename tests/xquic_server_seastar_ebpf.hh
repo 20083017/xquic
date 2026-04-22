@@ -2,10 +2,13 @@
 
 #include "user_conn.h"
 #include "xquic_seastar_integration.hh"
+#include "xquic_ebpf_reuseport.h"
 
 #include <seastar/core/distributed.hh>
 #include <seastar/core/future.hh>
 #include <seastar/core/gate.hh>
+#include <seastar/core/posix.hh>
+#include <seastar/core/reactor.hh>
 #include <seastar/core/sharded.hh>
 #include <seastar/core/timer.hh>
 #include <seastar/net/api.hh>
@@ -18,39 +21,54 @@
 #include <unordered_map>
 
 /**
- * Multi-core Seastar QUIC server using seastar::distributed<>.
+ * POSIX + eBPF Seastar QUIC server — Phase 4 evaluation variant.
  *
- * Architecture (per-shard reactor model):
- *   Every shard: own UDP channel (bound), own receive loop, own send path.
- *   POSIX mode:  shard 0 receives all traffic, routes via DCID to target shard.
- *                Each shard sends directly via its own unbound UDP channel.
- *   Native/DPDK: every shard gets its own bound channel; Seastar distributes
- *                incoming packets across shards automatically.
+ * Architecture:
+ *   Every shard: binds its own UDP socket to the same port via SO_REUSEPORT.
+ *   A classic BPF program (SO_ATTACH_REUSEPORT_CBPF) is attached to steer
+ *   incoming packets to the correct socket/shard based on QUIC DCID[0].
  *
- * CID routing: cid_generate_cb embeds shard_id in CID[0] for O(1) dispatch.
- * Initial packets (unknown CID / long header) are handled on receiving shard.
+ *   This is a POSIX-only approach that achieves per-shard receive without
+ *   DPDK or cross-shard submit_to() overhead:
+ *     - Kernel distributes packets to the correct shard at socket level.
+ *     - Each shard has its own bound socket: both recv and send.
+ *     - No shard-0 bottleneck, no unbound send channels.
+ *     - CID generation embeds shard_id in CID[0] (same as DPDK variant).
+ *
+ *   Fallback: if SO_ATTACH_REUSEPORT_CBPF fails (old kernel, no CAP),
+ *   degrades to the original shard-0-only POSIX mode.
+ *
+ * Comparison targets:
+ *   - DPDK mode: zero-copy NIC → userspace, best for high-throughput.
+ *   - eBPF mode: kernel-level steering, no NIC driver changes, easier to deploy.
+ *   - Plain POSIX: shard-0 bottleneck, baseline for comparison.
  */
-class XquicSeastarServer {
+class XquicSeastarServerEbpf {
 public:
-    XquicSeastarServer();
-    ~XquicSeastarServer();
+    XquicSeastarServerEbpf();
+    ~XquicSeastarServerEbpf();
 
-    /* Called by seastar::distributed<>::start() on each shard */
     seastar::future<> start_service(uint16_t port, const std::string& cert_path, const std::string& key_path,
                                     bool echo_mode, bool video_mode, const std::string& video_output_dir);
     seastar::future<> stop();
 
-    /* Set the distributed<> back-pointer (called once on each shard after start) */
-    void set_distributed(seastar::distributed<XquicSeastarServer> *dist) { _distributed = dist; }
+    void set_distributed(seastar::distributed<XquicSeastarServerEbpf> *dist) { _distributed = dist; }
 
-    /* Cross-shard packet delivery: invoked on target shard via submit_to */
+    /**
+     * Set the pre-created reuseport file descriptors.
+     * Called on shard 0 before start_service.  Shard 0 creates all sockets
+     * from the main thread (before Seastar reactors start), then distributes
+     * FDs to each shard via invoke_on().
+     */
+    void set_reuseport_fd(int fd) { _reuseport_fd = fd; }
+
+    /* Cross-shard packet delivery fallback (only used in degraded POSIX mode) */
     void deliver_packet(seastar::temporary_buffer<char> data,
                         struct sockaddr_storage peer_addr, socklen_t peer_len,
                         struct sockaddr_storage local_addr, socklen_t local_len);
 
 private:
-    std::optional<seastar::net::udp_channel> _udp_channel;       /* per-shard: bound (shard 0) or unbound (others, POSIX) */
-    std::optional<seastar::net::udp_channel> _send_channel;      /* per-shard: dedicated send channel (POSIX non-shard-0) */
+    std::optional<seastar::net::udp_channel> _udp_channel;
     std::optional<seastar::future<>> _receive_loop;
     seastar::gate _background_ops;
     seastar::timer<> _engine_timer;
@@ -65,10 +83,11 @@ private:
     bool _echo_mode;
     bool _video_mode;
     std::string _video_output_dir;
-    bool _native_stack;   /* true when using Seastar native/DPDK net stack */
-    seastar::distributed<XquicSeastarServer> *_distributed = nullptr;
+    bool _ebpf_mode;    /* true if eBPF reuseport is active */
+    bool _fallback_posix;  /* true if degraded to shard-0-only POSIX */
+    int _reuseport_fd;  /* pre-created reuseport socket fd, or -1 */
+    seastar::distributed<XquicSeastarServerEbpf> *_distributed = nullptr;
 
-    // Statistics for benchmarking
     struct Stats {
         uint64_t conns_accepted = 0;
         uint64_t conns_closed = 0;
@@ -116,6 +135,7 @@ private:
 
     int on_h3_conn_create_notify(xqc_h3_conn_t *conn, const xqc_cid_t *cid, void *user_data);
     int on_h3_conn_close_notify(xqc_h3_conn_t *conn, const xqc_cid_t *cid, void *user_data);
+    int on_h3_request_create_notify(xqc_h3_request_t *req, void *strm_user_data);
     xqc_int_t on_h3_request_write_notify(xqc_h3_request_t *req, void *user_data);
     xqc_int_t on_h3_request_read_notify(xqc_h3_request_t *req, xqc_request_notify_flag_t flag, void *user_data);
     xqc_int_t on_h3_request_close_notify(xqc_h3_request_t *req, void *user_data);
@@ -139,6 +159,7 @@ private:
     static xqc_int_t ss_stream_close_notify(xqc_stream_t *stream, void *user_data);
     static int ss_h3_conn_create_notify(xqc_h3_conn_t *conn, const xqc_cid_t *cid, void *user_data);
     static int ss_h3_conn_close_notify(xqc_h3_conn_t *conn, const xqc_cid_t *cid, void *user_data);
+    static xqc_int_t ss_h3_request_create_notify(xqc_h3_request_t *req, void *strm_user_data);
     static xqc_int_t ss_h3_request_write_notify(xqc_h3_request_t *req, void *user_data);
     static xqc_int_t ss_h3_request_read_notify(xqc_h3_request_t *req, xqc_request_notify_flag_t flag, void *user_data);
     static xqc_int_t ss_h3_request_close_notify(xqc_h3_request_t *req, void *user_data);

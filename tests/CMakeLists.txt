@@ -120,6 +120,23 @@ if(XQC_ENABLE_SEASTAR_EXAMPLE)
         dl
         pthread
     )
+
+    # POSIX + eBPF reuseport variant (Phase 4 evaluation)
+    add_executable(xquic_server_seastar_ebpf
+        xquic_server_seastar_ebpf.cpp
+    )
+
+    target_compile_features(xquic_server_seastar_ebpf PRIVATE cxx_std_20)
+
+    target_link_libraries(xquic_server_seastar_ebpf
+        PRIVATE
+        xquic-static
+        ${SEASTAR_LINK_TARGET}
+        ${SSL_LIB_PATH}
+        m
+        dl
+        pthread
+    )
 endif()
 
 

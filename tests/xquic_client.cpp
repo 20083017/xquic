@@ -272,6 +272,7 @@ XquicClient::XquicClient() {
     num_connections_ = 1;
     conns_created_ = 0;
     conns_completed_ = 0;
+    close_after_request_ = 0;
     bench_start_time_ = 0;
 }
 
@@ -317,6 +318,8 @@ int XquicClient::init(int argc, char *argv[]) {
         } else if (strcmp(argv[i], "-n") == 0 && i + 1 < argc) {
             num_connections_ = atoi(argv[++i]);
             if (num_connections_ < 1) num_connections_ = 1;
+        } else if (strcmp(argv[i], "-c") == 0) {
+            close_after_request_ = 1;
         }
     }
 
@@ -401,6 +404,7 @@ int XquicClient::init(int argc, char *argv[]) {
             .h3c_cbs = {
                 .h3_conn_create_notify = xqc_client_h3_conn_create_notify_tramp,
                 .h3_conn_close_notify = xqc_client_h3_conn_close_notify_tramp,
+                .h3_conn_handshake_finished = xqc_client_h3_conn_handshake_finished_tramp,
             },
             .h3r_cbs = {
                 .h3_request_close_notify = xqc_client_request_close_notify_tramp,
@@ -621,8 +625,6 @@ void XquicClient::on_h3_conn_create_notify(xqc_h3_conn_t *conn, const xqc_cid_t 
     user_conn_t *u_conn = (user_conn_t *)user_data;
     if (u_conn) {
         u_conn->h3_conn = conn;
-        // Send Request
-        send_request(u_conn);
     }
 }
 
@@ -633,6 +635,10 @@ void XquicClient::on_h3_conn_close_notify(xqc_h3_conn_t *conn, const xqc_cid_t *
 
 void XquicClient::on_h3_conn_handshake_finished(xqc_h3_conn_t *h3_conn, void *user_data) {
     printf("client: h3 handshake finished\n");
+    user_conn_t *u_conn = (user_conn_t *)user_data;
+    if (u_conn) {
+        send_request(u_conn);
+    }
 }
 
 void XquicClient::on_h3_conn_ping_acked(xqc_h3_conn_t *conn, const xqc_cid_t *cid, void *ping_user_data, void *user_data) {
@@ -708,6 +714,11 @@ xqc_int_t XquicClient::on_stream_read_notify(xqc_stream_t *stream, void *user_da
                     printf("====>Echo Check Failed\n");
                 }
             }
+
+            // Close connection immediately after stream completes (bench mode)
+            if (close_after_request_ && user_stream->user_conn) {
+                xqc_conn_close(engine_, &user_stream->user_conn->cid);
+            }
             break;
         }
     }
@@ -737,14 +748,14 @@ xqc_int_t XquicClient::on_request_read_notify(xqc_h3_request_t *req, xqc_request
     if (!user_stream) return 0;
 
     if (flag & XQC_REQ_NOTIFY_READ_HEADER) {
-        xqc_http_headers_t *headers = xqc_h3_request_recv_headers(req, NULL);
+        uint8_t fin = 0;
+        xqc_http_headers_t *headers = xqc_h3_request_recv_headers(req, &fin);
         if (headers) {
             for (int i = 0; i < headers->count; i++) {
                 printf("client header: %.*s = %.*s\n", 
                        (int)headers->headers[i].name.iov_len, (char*)headers->headers[i].name.iov_base,
                        (int)headers->headers[i].value.iov_len, (char*)headers->headers[i].value.iov_base);
             }
-            free(headers); 
         }
         user_stream->header_recvd = 1;
     }
@@ -807,6 +818,14 @@ xqc_int_t XquicClient::on_request_read_notify(xqc_h3_request_t *req, xqc_request
             if (save_file_ && user_stream->recv_body_fp) {
                 fclose(user_stream->recv_body_fp);
                 user_stream->recv_body_fp = NULL;
+            }
+
+            // Close connection immediately after request completes (bench mode)
+            if (close_after_request_ && user_stream->user_conn) {
+                user_conn_t *u_conn = user_stream->user_conn;
+                if (u_conn->h3_conn) {
+                    xqc_h3_conn_close(engine_, &u_conn->cid);
+                }
             }
         }
     }
@@ -875,36 +894,21 @@ void XquicClient::send_request(user_conn_t *u_conn) {
         xqc_h3_request_set_user_data(req, user_stream);
         
         // Send Headers
-        std::vector<std::string> headers_str = {":method: GET", ":path: /", ":scheme: https"};
-        std::vector<xqc_http_header_t> headers;
-        
-        for (const auto& h : headers_str) {
-            size_t pos = h.find(':');
-            if (pos != std::string::npos) {
-                xqc_http_header_t header;
-                // Fix dangling pointer by duplicating string
-                std::string name = h.substr(0, pos);
-                std::string value = h.substr(pos+1);
-                
-                header.name.iov_base = strdup(name.c_str());
-                header.name.iov_len = name.length();
-                header.value.iov_base = strdup(value.c_str());
-                header.value.iov_len = value.length();
-                headers.push_back(header);
-            }
-        }
+        xqc_http_header_t hdrs[3];
+        memset(hdrs, 0, sizeof(hdrs));
+
+        hdrs[0].name  = {(unsigned char*)":method", 7};
+        hdrs[0].value = {(unsigned char*)"GET", 3};
+        hdrs[1].name  = {(unsigned char*)":path", 5};
+        hdrs[1].value = {(unsigned char*)"/", 1};
+        hdrs[2].name  = {(unsigned char*)":scheme", 7};
+        hdrs[2].value = {(unsigned char*)"https", 5};
         
         xqc_http_headers_t h_headers;
-        h_headers.headers = headers.data();
-        h_headers.count = headers.size();
+        h_headers.headers = hdrs;
+        h_headers.count = 3;
         
         xqc_h3_request_send_headers(req, &h_headers, 0);
-        
-        // Free duplicated strings after sending headers if API doesn't take ownership
-        for (auto& hdr : headers) {
-            free((void*)hdr.name.iov_base);
-            free((void*)hdr.value.iov_base);
-        }
         
         user_stream->header_sent = 1;
         

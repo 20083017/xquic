@@ -2,9 +2,14 @@
 # build_seastar.sh — 使用 submodule 方式构建 xquic + seastar 集成 (quictls)
 #
 # 用法:
-#   ./build_seastar.sh          # 默认构建
-#   ./build_seastar.sh clean    # 清理后重新构建
-#   ./build_seastar.sh deps     # 仅安装系统依赖 (Ubuntu/Debian)
+#   ./build_seastar.sh                # 默认构建
+#   ./build_seastar.sh clean          # 清理后重新构建
+#   ./build_seastar.sh deps           # 仅安装系统依赖 (Ubuntu/Debian)
+#   ./build_seastar.sh dpdk           # 启用 Seastar_DPDK 构建 xquic_server_seastar
+#
+# 可选环境变量:
+#   DPDK_CONFIG_FILE        参考配置文件路径，默认 third_party/seastar/dpdk-custom.conf
+#   SEASTAR_DPDK_MACHINE    DPDK machine 参数，默认 native
 
 set -euo pipefail
 
@@ -14,6 +19,14 @@ QUICTLS_SRC="${SCRIPT_DIR}/third_party/quictls"
 QUICTLS_INSTALL="${QUICTLS_SRC}/build"
 SEASTAR_DIR="${SCRIPT_DIR}/third_party/seastar"
 NPROC=$(nproc 2>/dev/null || echo 4)
+DPDK_CONFIG_FILE_DEFAULT="${SEASTAR_DIR}/dpdk-custom.conf"
+DPDK_CONFIG_FILE="${DPDK_CONFIG_FILE:-${DPDK_CONFIG_FILE_DEFAULT}}"
+SEASTAR_DPDK_MACHINE="${SEASTAR_DPDK_MACHINE:-native}"
+ENABLE_DPDK=0
+
+if [[ "${DPDK_CONFIG_FILE}" != /* ]]; then
+    DPDK_CONFIG_FILE="${SCRIPT_DIR}/${DPDK_CONFIG_FILE}"
+fi
 
 # 颜色输出
 RED='\033[0;31m'
@@ -90,21 +103,37 @@ build_xquic_seastar() {
 
     # Boost 1.83 installed in /usr/local
     local BOOST_ROOT="/usr/local"
-
-    cmake -S "${SCRIPT_DIR}" -B "${BUILD_DIR}" \
-        -DXQC_ENABLE_SEASTAR=ON \
-        -DXQC_ENABLE_TESTING=ON \
-        -DSSL_TYPE=openssl \
-        -DSSL_PATH="${QUICTLS_INSTALL}" \
-        -DSSL_INC_PATH="${QUICTLS_INSTALL}/include" \
-        -DSSL_LIB_PATH="${QUICTLS_INSTALL}/lib64/libssl.a;${QUICTLS_INSTALL}/lib64/libcrypto.a" \
-        -DBOOST_ROOT="${BOOST_ROOT}" \
+    local cmake_args=(
+        -S "${SCRIPT_DIR}" -B "${BUILD_DIR}"
+        -DXQC_ENABLE_SEASTAR=ON
+        -DXQC_ENABLE_TESTING=ON
+        -DSSL_TYPE=openssl
+        -DSSL_PATH="${QUICTLS_INSTALL}"
+        -DSSL_INC_PATH="${QUICTLS_INSTALL}/include"
+        -DSSL_LIB_PATH="${QUICTLS_INSTALL}/lib64/libssl.a;${QUICTLS_INSTALL}/lib64/libcrypto.a"
+        -DBOOST_ROOT="${BOOST_ROOT}"
         -DBoost_NO_SYSTEM_PATHS=ON
+    )
+
+    if [ "${ENABLE_DPDK}" -eq 1 ]; then
+        info "启用 Seastar DPDK 构建: Seastar_DPDK=ON"
+        info "DPDK reference config: ${DPDK_CONFIG_FILE}"
+        if [ ! -f "${DPDK_CONFIG_FILE}" ]; then
+            error "DPDK 配置参考文件不存在: ${DPDK_CONFIG_FILE}"
+            exit 1
+        fi
+        cmake_args+=(
+            -DSeastar_DPDK=ON
+            -DSeastar_DPDK_MACHINE="${SEASTAR_DPDK_MACHINE}"
+        )
+    fi
+
+    cmake "${cmake_args[@]}"
 
     info "编译 xquic_server_seastar (${NPROC} 并行)..."
     cmake --build "${BUILD_DIR}" --target xquic_server_seastar -j"${NPROC}"
 
-    info "构建完成！可执行文件: ${BUILD_DIR}/tests/xquic_server_seastar"
+    info "构建完成！可执行文件: ${BUILD_DIR}/xquic_tests/xquic_server_seastar"
 }
 
 case "${1:-build}" in
@@ -130,8 +159,14 @@ case "${1:-build}" in
         build_quictls
         build_xquic_seastar
         ;;
+    dpdk)
+        ENABLE_DPDK=1
+        check_submodules
+        build_quictls
+        build_xquic_seastar
+        ;;
     *)
-        echo "用法: $0 [build|clean|deps]"
+        echo "用法: $0 [build|clean|deps|dpdk]"
         exit 1
         ;;
 esac
