@@ -434,6 +434,19 @@ struct xqc_connection_s {
     } dgram_stats;
 
     struct {
+        uint64_t                    queued_bytes;
+        uint32_t                    queued_segments;
+        uint32_t                    queued_chunks;
+        uint64_t                    dropped_segments;
+        uint64_t                    datagram_total;
+        uint64_t                    datagram_bytes;
+        xqc_usec_t                  qps_last_ts;
+        uint64_t                    qps_last_datagram_total;
+        uint64_t                    datagram_decrypt_qps;
+        uint64_t                    datagram_reassemble_qps;
+    } app_metrics;
+
+    struct {
         uint64_t                    send_bytes;
         uint64_t                    reinjected_bytes;
         uint64_t                    recv_bytes;

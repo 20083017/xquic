@@ -625,6 +625,7 @@ xqc_create_stream_with_conn(xqc_connection_t *conn, xqc_stream_id_t stream_id,
     xqc_stream_set_flow_ctl(stream);
 
     xqc_init_list_head(&stream->stream_data_in.frames_tailq);
+    xqc_init_app_payload_pool(&stream->stream_data_in.app_payload_pool);
 
     xqc_init_list_head(&stream->stream_write_buff_list.write_buff_list);
 
@@ -1378,6 +1379,7 @@ xqc_stream_recv(xqc_stream_t *stream, unsigned char *recv_buf, size_t recv_buf_s
     size_t read = 0;
     size_t frame_left;
     *fin = 0;
+    stream->stream_data_in.read_calls++;
 
     if (stream->stream_state_recv >= XQC_RECV_STREAM_ST_RESET_RECVD) {
         stream->stream_state_recv = XQC_RECV_STREAM_ST_RESET_READ;
@@ -1405,7 +1407,14 @@ xqc_stream_recv(xqc_stream_t *stream, unsigned char *recv_buf, size_t recv_buf_s
         if (stream_frame->data_offset + stream_frame->data_length < stream->stream_data_in.next_read_offset) {
             /* free frame */
             xqc_list_del_init(&stream_frame->sf_list);
-            xqc_free(stream_frame->data);
+            if (stream->stream_data_in.queued_segments > 0) {
+                stream->stream_data_in.queued_segments--;
+            }
+            if (stream_frame->chunk) {
+                xqc_destroy_app_payload_chunk(&stream->stream_data_in.app_payload_pool, stream_frame->chunk);
+                stream_frame->chunk = NULL;
+                stream_frame->data = NULL;
+            }
             xqc_free(stream_frame);
             continue;
         }
@@ -1426,13 +1435,22 @@ xqc_stream_recv(xqc_stream_t *stream, unsigned char *recv_buf, size_t recv_buf_s
             stream->stream_data_in.next_read_offset += frame_left;
             stream_frame->next_read_offset = stream_frame->data_length;
             read += frame_left;
+            stream->stream_data_in.app_payload_pool.total_bytes_out += frame_left;
             /* free frame */
             xqc_list_del_init(&stream_frame->sf_list);
-            xqc_free(stream_frame->data);
+            if (stream->stream_data_in.queued_segments > 0) {
+                stream->stream_data_in.queued_segments--;
+            }
+            if (stream_frame->chunk) {
+                xqc_destroy_app_payload_chunk(&stream->stream_data_in.app_payload_pool, stream_frame->chunk);
+                stream_frame->chunk = NULL;
+                stream_frame->data = NULL;
+            }
             xqc_free(stream_frame);
 
         } else {
             memcpy(recv_buf + read, stream_frame->data + stream_frame->next_read_offset, recv_buf_size - read);
+            stream->stream_data_in.app_payload_pool.total_bytes_out += recv_buf_size - read;
             stream_frame->next_read_offset += recv_buf_size - read;
             stream->stream_data_in.next_read_offset += recv_buf_size - read;
             read = recv_buf_size;
@@ -1450,6 +1468,10 @@ xqc_stream_recv(xqc_stream_t *stream, unsigned char *recv_buf, size_t recv_buf_s
             xqc_stream_recv_state_update(stream, XQC_RECV_STREAM_ST_DATA_READ);
             xqc_stream_maybe_need_close(stream);
         }
+    }
+
+    if (read == 0 && *fin == 0) {
+        stream->stream_data_in.read_eagain++;
     }
 
     stream->stream_conn->conn_flow_ctl.fc_data_read += read;
@@ -1809,10 +1831,111 @@ xqc_process_crypto_read_streams(xqc_connection_t *conn)
 }
 
 void
+xqc_init_app_payload_pool(xqc_app_payload_pool_t *pool)
+{
+    if (pool == NULL) {
+        return;
+    }
+
+    xqc_init_list_head(&pool->chunks);
+    pool->queued_bytes = 0;
+    pool->queued_chunks = 0;
+    pool->total_bytes_in = 0;
+    pool->total_bytes_out = 0;
+    pool->total_chunks_in = 0;
+}
+
+xqc_app_payload_chunk_t *
+xqc_app_payload_chunk_create(const unsigned char *data, unsigned data_length, uint64_t data_offset)
+{
+    xqc_app_payload_chunk_t *chunk = xqc_calloc(1, sizeof(xqc_app_payload_chunk_t));
+    if (chunk == NULL) {
+        return NULL;
+    }
+
+    chunk->data = (unsigned char *)data;
+    chunk->data_length = data_length;
+    chunk->data_offset = data_offset;
+    xqc_init_list_head(&chunk->chunk_list);
+    return chunk;
+}
+
+void
+xqc_destroy_app_payload_chunk(xqc_app_payload_pool_t *pool, xqc_app_payload_chunk_t *chunk)
+{
+    if (chunk == NULL) {
+        return;
+    }
+
+    if (!xqc_list_empty(&chunk->chunk_list)) {
+        xqc_list_del_init(&chunk->chunk_list);
+    }
+
+    if (pool != NULL) {
+        if (pool->queued_chunks > 0) {
+            pool->queued_chunks--;
+        }
+        if (pool->queued_bytes >= chunk->data_length) {
+            pool->queued_bytes -= chunk->data_length;
+        } else {
+            pool->queued_bytes = 0;
+        }
+    }
+
+    if (chunk->data) {
+        xqc_free(chunk->data);
+    }
+
+    xqc_free(chunk);
+}
+
+void
+xqc_stream_update_app_qps(xqc_stream_t *stream, xqc_usec_t now)
+{
+    uint64_t elapsed;
+    uint64_t chunk_delta;
+    uint64_t segment_delta;
+
+    if (stream == NULL) {
+        return;
+    }
+
+    if (stream->stream_data_in.qps_last_ts == 0) {
+        stream->stream_data_in.qps_last_ts = now;
+        stream->stream_data_in.qps_last_chunk_total = stream->stream_data_in.app_payload_pool.total_chunks_in;
+        stream->stream_data_in.qps_last_segment_total = stream->stream_data_in.total_segments_in;
+        return;
+    }
+
+    if (now <= stream->stream_data_in.qps_last_ts) {
+        return;
+    }
+
+    elapsed = now - stream->stream_data_in.qps_last_ts;
+    if (elapsed < 1000000) {
+        return;
+    }
+
+    chunk_delta = stream->stream_data_in.app_payload_pool.total_chunks_in - stream->stream_data_in.qps_last_chunk_total;
+    segment_delta = stream->stream_data_in.total_segments_in - stream->stream_data_in.qps_last_segment_total;
+
+    stream->stream_data_in.stage_decrypt_qps = chunk_delta * 1000000 / elapsed;
+    stream->stream_data_in.stage_reassemble_qps = segment_delta * 1000000 / elapsed;
+    stream->stream_data_in.qps_last_ts = now;
+    stream->stream_data_in.qps_last_chunk_total = stream->stream_data_in.app_payload_pool.total_chunks_in;
+    stream->stream_data_in.qps_last_segment_total = stream->stream_data_in.total_segments_in;
+}
+
+void
 xqc_destroy_stream_frame(xqc_stream_frame_t *stream_frame)
 {
     if (stream_frame) {
-        if (stream_frame->data) {
+        if (stream_frame->chunk) {
+            xqc_destroy_app_payload_chunk(NULL, stream_frame->chunk);
+            stream_frame->chunk = NULL;
+            stream_frame->data = NULL;
+
+        } else if (stream_frame->data) {
             xqc_free(stream_frame->data);
         }
 

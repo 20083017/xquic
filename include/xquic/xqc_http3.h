@@ -240,6 +240,14 @@ typedef struct xqc_request_stats_s {
     xqc_usec_t  recv_time_with_fec;
     xqc_usec_t  final_packet_time;
     xqc_usec_t  stream_close_delay;
+
+    uint64_t    app_queued_bytes;
+    uint32_t    app_queued_segments;
+    uint32_t    app_queued_chunks;
+    uint64_t    app_dropped_segments;
+    uint64_t    app_decrypt_qps;
+    uint64_t    app_reassemble_qps;
+    xqc_usec_t  app_write_delay_us;
 } xqc_request_stats_t;
 
 /**

@@ -71,10 +71,27 @@ typedef struct {
     xqc_usec_t              fc_last_window_update_time;
 } xqc_stream_flow_ctl_t;
 
+typedef struct xqc_app_payload_chunk_s {
+    xqc_list_head_t         chunk_list;
+    unsigned char          *data;
+    unsigned                data_length;
+    uint64_t                data_offset;
+} xqc_app_payload_chunk_t;
+
+typedef struct xqc_app_payload_pool_s {
+    xqc_list_head_t         chunks;
+    uint64_t                queued_bytes;
+    uint32_t                queued_chunks;
+    uint64_t                total_bytes_in;
+    uint64_t                total_bytes_out;
+    uint64_t                total_chunks_in;
+} xqc_app_payload_pool_t;
+
 
 /* Put one STREAM frame */
 typedef struct xqc_stream_frame_s {
     xqc_list_head_t         sf_list;
+    xqc_app_payload_chunk_t *chunk;
     unsigned char          *data;
     unsigned                data_length;
     uint64_t                data_offset;
@@ -87,9 +104,20 @@ typedef struct xqc_stream_frame_s {
 typedef struct xqc_stream_data_in_s {
     /* A list of STREAM frame, order by offset */
     xqc_list_head_t         frames_tailq;       /* xqc_stream_frame_t */
+    xqc_app_payload_pool_t  app_payload_pool;
     uint64_t                merged_offset_end;  /* [0,end) */
     uint64_t                next_read_offset;   /* next offset in stream */
     uint64_t                stream_length;
+    uint32_t                queued_segments;
+    uint64_t                total_segments_in;
+    uint64_t                dropped_segments;
+    uint64_t                read_calls;
+    uint64_t                read_eagain;
+    xqc_usec_t              qps_last_ts;
+    uint64_t                qps_last_chunk_total;
+    uint64_t                qps_last_segment_total;
+    uint64_t                stage_decrypt_qps;
+    uint64_t                stage_reassemble_qps;
     xqc_bool_t              stream_determined;
 } xqc_stream_data_in_t;
 
@@ -217,6 +245,15 @@ xqc_stream_is_uni(xqc_stream_id_t stream_id)
 }
 
 void xqc_stream_set_priority(xqc_stream_t *stream, xqc_stream_priority_t priority);
+
+void xqc_init_app_payload_pool(xqc_app_payload_pool_t *pool);
+
+xqc_app_payload_chunk_t *xqc_app_payload_chunk_create(const unsigned char *data, unsigned data_length,
+    uint64_t data_offset);
+
+void xqc_destroy_app_payload_chunk(xqc_app_payload_pool_t *pool, xqc_app_payload_chunk_t *chunk);
+
+void xqc_stream_update_app_qps(xqc_stream_t *stream, xqc_usec_t now);
 
 xqc_stream_t *xqc_create_stream_with_conn (xqc_connection_t *conn, xqc_stream_id_t stream_id,
     xqc_stream_type_t stream_type, xqc_stream_settings_t *settings, void *user_data);

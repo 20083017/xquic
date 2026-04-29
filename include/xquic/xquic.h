@@ -1624,6 +1624,15 @@ typedef struct xqc_conn_stats_s {
     uint32_t            max_acked_mtu;
 
     uint32_t            fec_recover_pkt_cnt;
+    uint64_t            app_queued_bytes;
+    uint32_t            app_queued_segments;
+    uint32_t            app_queued_chunks;
+    uint64_t            app_dropped_segments;
+    uint64_t            app_decrypt_qps;
+    uint64_t            app_reassemble_qps;
+    uint32_t            quic_retrans_rate_ppm;
+    uint32_t            fec_repair_rate_ppm;
+    xqc_usec_t          write_delay_p99;
     xqc_usec_t          avg_close_time;
 } xqc_conn_stats_t;
 
@@ -1635,6 +1644,26 @@ typedef struct xqc_conn_qos_stats_s {
     /** initial value = 0 */
     uint64_t            inflight_bytes;
 } xqc_conn_qos_stats_t;
+
+typedef struct xqc_stream_app_stats_s {
+    uint64_t            queued_bytes;
+    uint32_t            queued_segments;
+    uint32_t            queued_chunks;
+    uint64_t            total_chunks_in;
+    uint64_t            total_segments_in;
+    uint64_t            total_bytes_in;
+    uint64_t            total_bytes_out;
+    uint64_t            read_calls;
+    uint64_t            read_eagain;
+    uint64_t            stage_decrypt_qps;
+    uint64_t            stage_reassemble_qps;
+    uint64_t            dropped_segments;
+    xqc_usec_t          write_delay_us;
+    uint32_t            retrans_pkt_cnt;
+    uint32_t            recov_pkt_cnt;
+    uint32_t            fec_send_rpr_cnt;
+    uint32_t            fec_recover_pkt_cnt;
+} xqc_stream_app_stats_t;
 
 /*************************************************************
  *  engine layer APIs
@@ -2150,6 +2179,21 @@ xqc_conn_stats_t xqc_conn_get_stats(xqc_engine_t *engine, const xqc_cid_t *cid);
  */
 XQC_EXPORT_PUBLIC_API
 xqc_conn_qos_stats_t xqc_conn_get_qos_stats(xqc_engine_t *engine, const xqc_cid_t *cid);
+
+/**
+ * User can get xqc_stream_app_stats_t by cid and stream id
+ */
+XQC_EXPORT_PUBLIC_API
+xqc_stream_app_stats_t xqc_stream_get_app_stats(xqc_engine_t *engine, const xqc_cid_t *cid,
+    xqc_stream_id_t stream_id);
+
+/**
+ * Export connection and per-stream metrics in Prometheus text format.
+ * Returns bytes written on success, negative value on error.
+ */
+XQC_EXPORT_PUBLIC_API
+ssize_t xqc_conn_export_prometheus_metrics(xqc_engine_t *engine, const xqc_cid_t *cid,
+    char *buf, size_t buf_size);
 
 /**
  * create new path for client

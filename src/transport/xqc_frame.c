@@ -97,6 +97,23 @@ xqc_int_t
 xqc_insert_stream_frame(xqc_connection_t *conn, xqc_stream_t *stream, xqc_stream_frame_t *new_frame)
 {
 
+    if (new_frame->chunk == NULL && new_frame->data_length > 0) {
+        new_frame->chunk = xqc_app_payload_chunk_create(new_frame->data, new_frame->data_length,
+                                                        new_frame->data_offset);
+        if (new_frame->chunk == NULL) {
+            return -XQC_EMALLOC;
+        }
+        xqc_list_add_tail(&new_frame->chunk->chunk_list, &stream->stream_data_in.app_payload_pool.chunks);
+        stream->stream_data_in.app_payload_pool.queued_bytes += new_frame->data_length;
+        stream->stream_data_in.app_payload_pool.queued_chunks++;
+        stream->stream_data_in.app_payload_pool.total_bytes_in += new_frame->data_length;
+        stream->stream_data_in.app_payload_pool.total_chunks_in++;
+    }
+
+    stream->stream_data_in.queued_segments++;
+    stream->stream_data_in.total_segments_in++;
+    xqc_stream_update_app_qps(stream, xqc_monotonic_timestamp());
+
     /* insert xqc_stream_frame_t into stream->stream_data_in.frames_tailq in order of offset */
     unsigned char inserted = 0;
     xqc_list_head_t *pos;
@@ -125,6 +142,10 @@ xqc_insert_stream_frame(xqc_connection_t *conn, xqc_stream_t *stream, xqc_stream
         {
             xqc_log(conn->log, XQC_LOG_INFO, "|already recvd|offset:%ui|new_offset:%ui|len:%ud|new_len:%ud|",
                     frame->data_offset, new_frame->data_offset, frame->data_length, new_frame->data_length);
+            if (stream->stream_data_in.queued_segments > 0) {
+                stream->stream_data_in.queued_segments--;
+            }
+            stream->stream_data_in.dropped_segments++;
             return -XQC_EDUP_FRAME;
         }
 
@@ -167,6 +188,13 @@ xqc_insert_stream_frame(xqc_connection_t *conn, xqc_stream_t *stream, xqc_stream
             }
         }
     }
+
+    xqc_log(conn->log, XQC_LOG_DEBUG,
+            "|app_payload_pool|queued_bytes:%ui|queued_segments:%ud|queued_chunks:%ud|merged_offset:%ui|",
+            stream->stream_data_in.app_payload_pool.queued_bytes,
+            stream->stream_data_in.queued_segments,
+            stream->stream_data_in.app_payload_pool.queued_chunks,
+            stream->stream_data_in.merged_offset_end);
 
     return XQC_OK;
 }
@@ -1540,6 +1568,9 @@ xqc_process_datagram_frame(xqc_connection_t *conn, xqc_packet_in_t *packet_in)
 
     /* @TODO: datagram read callback */
     if (data_len > 0) {
+        conn->app_metrics.datagram_total++;
+        conn->app_metrics.datagram_bytes += data_len;
+
         if (conn->app_proto_cbs.dgram_cbs.datagram_read_notify
             && (conn->conn_flag & XQC_CONN_FLAG_UPPER_CONN_EXIST))
         {

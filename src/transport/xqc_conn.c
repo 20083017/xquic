@@ -34,7 +34,72 @@
 #include "src/tls/xqc_tls.h"
 #include "src/tls/xqc_tls_common.h"
 #include <inttypes.h>
+#include <stdarg.h>
+#include <stdlib.h>
 #include <openssl/rand.h>
+
+static int
+xqc_usec_cmp(const void *left, const void *right)
+{
+    xqc_usec_t l = *(const xqc_usec_t *)left;
+    xqc_usec_t r = *(const xqc_usec_t *)right;
+    return (l > r) - (l < r);
+}
+
+static int
+xqc_metrics_append(char *buf, size_t buf_size, size_t *cursor, const char *fmt, ...)
+{
+    int ret;
+    va_list args;
+
+    if (*cursor >= buf_size) {
+        return -XQC_ENOBUF;
+    }
+
+    va_start(args, fmt);
+    ret = vsnprintf(buf + *cursor, buf_size - *cursor, fmt, args);
+    va_end(args);
+
+    if (ret < 0) {
+        return ret;
+    }
+
+    if ((size_t)ret >= buf_size - *cursor) {
+        *cursor = buf_size;
+        return -XQC_ENOBUF;
+    }
+
+    *cursor += (size_t)ret;
+    return XQC_OK;
+}
+
+static void
+xqc_conn_refresh_datagram_qps(xqc_connection_t *conn, xqc_usec_t now)
+{
+    uint64_t elapsed;
+    uint64_t delta;
+
+    if (conn->app_metrics.qps_last_ts == 0) {
+        conn->app_metrics.qps_last_ts = now;
+        conn->app_metrics.qps_last_datagram_total = conn->app_metrics.datagram_total;
+        return;
+    }
+
+    if (now <= conn->app_metrics.qps_last_ts) {
+        return;
+    }
+
+    elapsed = now - conn->app_metrics.qps_last_ts;
+    if (elapsed < 1000000) {
+        return;
+    }
+
+    delta = conn->app_metrics.datagram_total - conn->app_metrics.qps_last_datagram_total;
+    conn->app_metrics.datagram_decrypt_qps = delta * 1000000 / elapsed;
+    conn->app_metrics.datagram_reassemble_qps = conn->app_metrics.datagram_decrypt_qps;
+    conn->app_metrics.qps_last_ts = now;
+    conn->app_metrics.qps_last_datagram_total = conn->app_metrics.datagram_total;
+}
 
 xqc_conn_settings_t internal_default_conn_settings = {
     .pacing_on                  = 0,
@@ -1498,6 +1563,9 @@ xqc_conn_destroy(xqc_connection_t *xc)
             "fec_exist:%ud|"
             "fec_ensch:%s|fec_desch:%s|fec_neg_fail:%ud|"
             "fec_mp_mode:%s|send_fec_pkts:%ud|recovered_fec_num:%ud|"
+            "app_queued_bytes:%ui|app_queued_segments:%ud|app_queued_chunks:%ud|"
+            "app_drop_segments:%ui|app_decrypt_qps:%ui|app_reassemble_qps:%ui|"
+            "quic_retrans_rate_ppm:%ud|fec_repair_rate_ppm:%ud|write_p99:%ui|"
             "max_po_size:%uz|max_probing_size:%uz|ppo_size:%uz|"
             "ext_conn_info:%s|max_acked_po_size:%uz|enable_pmtud:%ui|avg_closed_time:%ui|"
             ,
@@ -1523,6 +1591,9 @@ xqc_conn_destroy(xqc_connection_t *xc)
             fec_flag,
             ensch_str, desch_str, xc->fec_neg_fail_reason,
             fec_mpm_str, conn_stats.send_fec_cnt, xc->fec_ctl ? xc->fec_ctl->fec_recover_pkt_cnt : 0,
+            conn_stats.app_queued_bytes, conn_stats.app_queued_segments, conn_stats.app_queued_chunks,
+            conn_stats.app_dropped_segments, conn_stats.app_decrypt_qps, conn_stats.app_reassemble_qps,
+            conn_stats.quic_retrans_rate_ppm, conn_stats.fec_repair_rate_ppm, conn_stats.write_delay_p99,
             xc->pkt_out_size, xc->max_pkt_out_size, xc->probing_pkt_out_size,
             conn_stats.extern_conn_info, xc->max_acked_po_size, 
             xc->local_settings.enable_pmtud & xc->remote_settings.enable_pmtud, xc->conn_avg_close_delay
@@ -3675,6 +3746,63 @@ xqc_conn_get_stats_internal(xqc_connection_t *conn, xqc_conn_stats_t *conn_stats
         conn_stats->fec_recover_pkt_cnt = conn->fec_ctl->fec_recover_pkt_cnt;
     }
 
+    xqc_conn_refresh_datagram_qps(conn, xqc_monotonic_timestamp());
+    conn_stats->app_decrypt_qps += conn->app_metrics.datagram_decrypt_qps;
+    conn_stats->app_reassemble_qps += conn->app_metrics.datagram_reassemble_qps;
+
+    xqc_list_head_t *stream_pos;
+    xqc_stream_t *stream;
+    uint64_t total_stream_sent_pkts = 0;
+    uint64_t total_stream_retrans_pkts = 0;
+    size_t write_delay_cnt = 0;
+    size_t write_delay_cap = 16;
+    xqc_usec_t *write_delays = xqc_malloc(sizeof(xqc_usec_t) * write_delay_cap);
+    xqc_list_for_each(stream_pos, &conn->conn_all_streams) {
+        stream = xqc_list_entry(stream_pos, xqc_stream_t, all_stream_list);
+        xqc_stream_update_app_qps(stream, xqc_monotonic_timestamp());
+
+        conn_stats->app_queued_bytes += stream->stream_data_in.app_payload_pool.queued_bytes;
+        conn_stats->app_queued_segments += stream->stream_data_in.queued_segments;
+        conn_stats->app_queued_chunks += stream->stream_data_in.app_payload_pool.queued_chunks;
+        conn_stats->app_dropped_segments += stream->stream_data_in.dropped_segments;
+        conn_stats->app_decrypt_qps += stream->stream_data_in.stage_decrypt_qps;
+        conn_stats->app_reassemble_qps += stream->stream_data_in.stage_reassemble_qps;
+        total_stream_sent_pkts += stream->stream_stats.sent_pkt_cnt;
+        total_stream_retrans_pkts += stream->stream_stats.retrans_pkt_cnt;
+
+        if (stream->stream_stats.first_write_time && stream->stream_stats.first_snd_time
+            && stream->stream_stats.first_snd_time >= stream->stream_stats.first_write_time)
+        {
+            if (write_delay_cnt == write_delay_cap) {
+                size_t new_cap = write_delay_cap * 2;
+                xqc_usec_t *new_delays = xqc_realloc(write_delays, sizeof(xqc_usec_t) * new_cap);
+                if (new_delays == NULL) {
+                    break;
+                }
+                write_delays = new_delays;
+                write_delay_cap = new_cap;
+            }
+            write_delays[write_delay_cnt++] = stream->stream_stats.first_snd_time - stream->stream_stats.first_write_time;
+        }
+    }
+
+    if (total_stream_sent_pkts > 0) {
+        conn_stats->quic_retrans_rate_ppm = (uint32_t)(total_stream_retrans_pkts * 1000000 / total_stream_sent_pkts);
+    }
+
+    if (conn_stats->send_fec_cnt > 0) {
+        conn_stats->fec_repair_rate_ppm = (uint32_t)((uint64_t)conn_stats->fec_recover_pkt_cnt * 1000000 / conn_stats->send_fec_cnt);
+    }
+
+    if (write_delays && write_delay_cnt > 0) {
+        qsort(write_delays, write_delay_cnt, sizeof(xqc_usec_t), xqc_usec_cmp);
+        conn_stats->write_delay_p99 = write_delays[((write_delay_cnt - 1) * 99) / 100];
+    }
+
+    if (write_delays) {
+        xqc_free(write_delays);
+    }
+
 
     /* 3. 遍历路径，获取各个路径count加和 */
     xqc_list_head_t *pos, *next;
@@ -3969,6 +4097,130 @@ xqc_conn_generate_plain_token(xqc_connection_t *conn, uint8_t ts_index, unsigned
 /*
  * 
  * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+
+xqc_stream_app_stats_t
+xqc_stream_get_app_stats(xqc_engine_t *engine, const xqc_cid_t *cid, xqc_stream_id_t stream_id)
+{
+    xqc_stream_app_stats_t app_stats;
+    xqc_connection_t *conn;
+    xqc_stream_t *stream;
+
+    xqc_memzero(&app_stats, sizeof(app_stats));
+
+    conn = xqc_engine_conns_hash_find(engine, cid, 's');
+    if (!conn) {
+        xqc_log(engine->log, XQC_LOG_ERROR, "|can not find connection|cid:%s",
+                xqc_scid_str(engine, cid));
+        return app_stats;
+    }
+
+    stream = xqc_find_stream_by_id(stream_id, conn->streams_hash);
+    if (stream == NULL) {
+        stream = xqc_find_stream_by_id(stream_id, conn->passive_streams_hash);
+    }
+    if (stream == NULL) {
+        xqc_log(engine->log, XQC_LOG_ERROR, "|can not find stream|cid:%s|stream_id:%ui|",
+                xqc_scid_str(engine, cid), stream_id);
+        return app_stats;
+    }
+
+    app_stats.queued_bytes = stream->stream_data_in.app_payload_pool.queued_bytes;
+    app_stats.queued_segments = stream->stream_data_in.queued_segments;
+    app_stats.queued_chunks = stream->stream_data_in.app_payload_pool.queued_chunks;
+    app_stats.total_chunks_in = stream->stream_data_in.app_payload_pool.total_chunks_in;
+    app_stats.total_segments_in = stream->stream_data_in.total_segments_in;
+    app_stats.total_bytes_in = stream->stream_data_in.app_payload_pool.total_bytes_in;
+    app_stats.total_bytes_out = stream->stream_data_in.app_payload_pool.total_bytes_out;
+    app_stats.read_calls = stream->stream_data_in.read_calls;
+    app_stats.read_eagain = stream->stream_data_in.read_eagain;
+    xqc_stream_update_app_qps(stream, xqc_monotonic_timestamp());
+    app_stats.stage_decrypt_qps = stream->stream_data_in.stage_decrypt_qps;
+    app_stats.stage_reassemble_qps = stream->stream_data_in.stage_reassemble_qps;
+    app_stats.dropped_segments = stream->stream_data_in.dropped_segments;
+    app_stats.write_delay_us = xqc_calc_delay(stream->stream_stats.first_snd_time, stream->stream_stats.first_write_time);
+    app_stats.retrans_pkt_cnt = stream->stream_stats.retrans_pkt_cnt;
+    app_stats.recov_pkt_cnt = stream->stream_stats.recov_pkt_cnt;
+    app_stats.fec_send_rpr_cnt = stream->stream_stats.fec_send_rpr_cnt;
+    app_stats.fec_recover_pkt_cnt = conn->conn_stats.fec_recover_pkt_cnt;
+
+    return app_stats;
+}
+
+ssize_t
+xqc_conn_export_prometheus_metrics(xqc_engine_t *engine, const xqc_cid_t *cid,
+    char *buf, size_t buf_size)
+{
+    xqc_connection_t *conn;
+    xqc_conn_stats_t conn_stats;
+    xqc_list_head_t *pos;
+    unsigned char *cid_str;
+    size_t cursor = 0;
+    int ret;
+
+    if (buf == NULL || buf_size == 0) {
+        return -XQC_EPARAM;
+    }
+
+    conn = xqc_engine_conns_hash_find(engine, cid, 's');
+    if (conn == NULL) {
+        return -XQC_ECONN_NFOUND;
+    }
+
+    conn_stats = xqc_conn_get_stats(engine, cid);
+    cid_str = xqc_scid_str(engine, cid);
+
+#define XQC_APPEND_METRIC(...)                                                   \
+    do {                                                                         \
+        ret = xqc_metrics_append(buf, buf_size, &cursor, __VA_ARGS__);           \
+        if (ret != XQC_OK) {                                                     \
+            return ret;                                                          \
+        }                                                                        \
+    } while (0)
+
+    XQC_APPEND_METRIC("# TYPE xquic_conn_app_queued_bytes gauge\n");
+    XQC_APPEND_METRIC("xquic_conn_app_queued_bytes{cid=\"%s\"} %"PRIu64"\n", cid_str, conn_stats.app_queued_bytes);
+    XQC_APPEND_METRIC("xquic_conn_app_queued_segments{cid=\"%s\"} %u\n", cid_str, conn_stats.app_queued_segments);
+    XQC_APPEND_METRIC("xquic_conn_app_queued_chunks{cid=\"%s\"} %u\n", cid_str, conn_stats.app_queued_chunks);
+    XQC_APPEND_METRIC("xquic_conn_app_dropped_segments_total{cid=\"%s\"} %"PRIu64"\n", cid_str, conn_stats.app_dropped_segments);
+    XQC_APPEND_METRIC("xquic_conn_app_decrypt_qps{cid=\"%s\"} %"PRIu64"\n", cid_str, conn_stats.app_decrypt_qps);
+    XQC_APPEND_METRIC("xquic_conn_app_reassemble_qps{cid=\"%s\"} %"PRIu64"\n", cid_str, conn_stats.app_reassemble_qps);
+    XQC_APPEND_METRIC("xquic_conn_loss_total{cid=\"%s\"} %u\n", cid_str, conn_stats.lost_count);
+    XQC_APPEND_METRIC("xquic_conn_send_total{cid=\"%s\"} %u\n", cid_str, conn_stats.send_count);
+    XQC_APPEND_METRIC("xquic_conn_quic_retrans_rate_ppm{cid=\"%s\"} %u\n", cid_str, conn_stats.quic_retrans_rate_ppm);
+    XQC_APPEND_METRIC("xquic_conn_fec_repair_rate_ppm{cid=\"%s\"} %u\n", cid_str, conn_stats.fec_repair_rate_ppm);
+    XQC_APPEND_METRIC("xquic_conn_write_delay_p99_us{cid=\"%s\"} %"PRIu64"\n", cid_str, conn_stats.write_delay_p99);
+    XQC_APPEND_METRIC("xquic_conn_datagram_total{cid=\"%s\"} %"PRIu64"\n", cid_str, conn->app_metrics.datagram_total);
+    XQC_APPEND_METRIC("xquic_conn_datagram_bytes_total{cid=\"%s\"} %"PRIu64"\n", cid_str, conn->app_metrics.datagram_bytes);
+    XQC_APPEND_METRIC("xquic_conn_datagram_decrypt_qps{cid=\"%s\"} %"PRIu64"\n", cid_str, conn->app_metrics.datagram_decrypt_qps);
+
+    xqc_list_for_each(pos, &conn->conn_all_streams) {
+        xqc_stream_t *stream = xqc_list_entry(pos, xqc_stream_t, all_stream_list);
+        xqc_stream_app_stats_t stream_stats = xqc_stream_get_app_stats(engine, cid, stream->stream_id);
+
+        XQC_APPEND_METRIC("xquic_stream_app_queued_bytes{cid=\"%s\",stream_id=\"%"PRIu64"\"} %"PRIu64"\n",
+                          cid_str, stream->stream_id, stream_stats.queued_bytes);
+        XQC_APPEND_METRIC("xquic_stream_app_queued_segments{cid=\"%s\",stream_id=\"%"PRIu64"\"} %u\n",
+                          cid_str, stream->stream_id, stream_stats.queued_segments);
+        XQC_APPEND_METRIC("xquic_stream_app_queued_chunks{cid=\"%s\",stream_id=\"%"PRIu64"\"} %u\n",
+                          cid_str, stream->stream_id, stream_stats.queued_chunks);
+        XQC_APPEND_METRIC("xquic_stream_app_decrypt_qps{cid=\"%s\",stream_id=\"%"PRIu64"\"} %"PRIu64"\n",
+                          cid_str, stream->stream_id, stream_stats.stage_decrypt_qps);
+        XQC_APPEND_METRIC("xquic_stream_app_reassemble_qps{cid=\"%s\",stream_id=\"%"PRIu64"\"} %"PRIu64"\n",
+                          cid_str, stream->stream_id, stream_stats.stage_reassemble_qps);
+        XQC_APPEND_METRIC("xquic_stream_app_dropped_segments_total{cid=\"%s\",stream_id=\"%"PRIu64"\"} %"PRIu64"\n",
+                          cid_str, stream->stream_id, stream_stats.dropped_segments);
+        XQC_APPEND_METRIC("xquic_stream_write_delay_us{cid=\"%s\",stream_id=\"%"PRIu64"\"} %"PRIu64"\n",
+                          cid_str, stream->stream_id, stream_stats.write_delay_us);
+        XQC_APPEND_METRIC("xquic_stream_retrans_total{cid=\"%s\",stream_id=\"%"PRIu64"\"} %u\n",
+                          cid_str, stream->stream_id, stream_stats.retrans_pkt_cnt);
+        XQC_APPEND_METRIC("xquic_stream_fec_recover_total{cid=\"%s\",stream_id=\"%"PRIu64"\"} %u\n",
+                          cid_str, stream->stream_id, stream_stats.recov_pkt_cnt);
+    }
+
+#undef XQC_APPEND_METRIC
+
+    return (ssize_t)cursor;
+}
  *                      RANDOM IV(96-bit)       
  * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
  * +-+-+-+-+-+-+-+-+

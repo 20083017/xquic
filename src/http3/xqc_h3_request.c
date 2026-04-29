@@ -57,6 +57,14 @@ xqc_h3_request_destroy(xqc_h3_request_t *h3_request)
 {
     xqc_h3_stream_t *h3s = h3_request->h3_stream;
 
+    /* xqc_h3_stream_close_notify() resets h3s->stream = NULL before
+     * triggering this destroy path. The stats-collection log below
+     * dereferences h3s->stream / h3c indirectly through several stats
+     * helpers and stats fields populated from stream-derived state, so
+     * skip the whole REPORT log when the transport stream is already
+     * gone — it's purely diagnostic. */
+    if (h3s != NULL && h3s->stream != NULL) {
+
     /* print request statistic log */
     xqc_request_stats_t stats = xqc_h3_request_get_stats(h3_request);
 
@@ -72,6 +80,8 @@ xqc_h3_request_destroy(xqc_h3_request_t *h3_request)
             "pacing_blk:%ud|pacing_blk_time:%ui|begin_state:%s|end_state:%s|"
             "is_fec_protected:%ud|fec_reco_pkt_cnt:%ud|fec_block_size_mode:%ud|"
             "fst_rpr_ts:%ui|last_rpr_ts:%ui|fec_fin_delay:%ui|"
+            "app_qbytes:%"PRIu64"|app_qseg:%u|app_qchk:%u|app_drop_seg:%"PRIu64"|"
+            "app_dqps:%"PRIu64"|app_rqps:%"PRIu64"|app_wdelay:%"PRIu64"|"
             "external_stream_info:%s|fastpath:%ud|",
             h3s->stream_id, stats.stream_close_msg ? stats.stream_close_msg : "",
             stats.stream_err, stats.recv_body_size, stats.send_body_size,
@@ -104,9 +114,14 @@ xqc_h3_request_destroy(xqc_h3_request_t *h3_request)
             stats.is_fec_protected, stats.fec_recov_cnt, h3_request->block_size_mode,
             stats.fst_rpr_time, stats.last_rpr_time,
             stats.fec_req_delay_time,
+            stats.app_queued_bytes, stats.app_queued_segments, stats.app_queued_chunks,
+            stats.app_dropped_segments, stats.app_decrypt_qps, stats.app_reassemble_qps,
+            stats.app_write_delay_us,
             stats.extern_stream_info,
             h3s->priority.fastpath
             );
+
+    } /* end if (h3s && h3s->stream) */
 
     if (h3_request->request_if->h3_request_close_notify) {
         h3_request->request_if->h3_request_close_notify(h3_request, h3_request->user_data);
@@ -395,6 +410,7 @@ xqc_request_stats_t
 xqc_h3_request_get_stats(xqc_h3_request_t *h3_request)
 {
     xqc_request_stats_t stats;
+    xqc_stream_t *stream = h3_request->h3_stream->stream;
     xqc_memzero(&stats, sizeof(stats));
 
     /* try to update stats */
@@ -441,6 +457,20 @@ xqc_h3_request_get_stats(xqc_h3_request_t *h3_request)
     stats.recv_time_with_fec = h3_request->recv_time_with_fec;
     stats.final_packet_time = h3_request->final_packet_time;
     stats.stream_close_delay = h3_request->stream_close_delay;
+    /* xqc_h3_stream_close_notify() sets h3_stream->stream = NULL before
+     * triggering xqc_h3_stream_destroy() → xqc_h3_request_destroy() →
+     * xqc_h3_request_get_stats(). Skip the stream-derived app_* metrics
+     * in that case to avoid a NULL deref. */
+    if (stream != NULL) {
+        xqc_stream_update_app_qps(stream, xqc_monotonic_timestamp());
+        stats.app_queued_bytes = stream->stream_data_in.app_payload_pool.queued_bytes;
+        stats.app_queued_segments = stream->stream_data_in.queued_segments;
+        stats.app_queued_chunks = stream->stream_data_in.app_payload_pool.queued_chunks;
+        stats.app_dropped_segments = stream->stream_data_in.dropped_segments;
+        stats.app_decrypt_qps = stream->stream_data_in.stage_decrypt_qps;
+        stats.app_reassemble_qps = stream->stream_data_in.stage_reassemble_qps;
+        stats.app_write_delay_us = xqc_calc_delay(stream->stream_stats.first_snd_time, stream->stream_stats.first_write_time);
+    }
     xqc_h3_stream_get_path_info(h3_request->h3_stream);
     xqc_request_path_metrics_print(h3_request->h3_stream->h3c->conn,
                                    h3_request->h3_stream, &stats);
@@ -459,7 +489,7 @@ xqc_h3_request_stats_print(xqc_h3_request_t *h3_request, char *str, size_t size)
     xqc_h3_request_encode_rtts(h3_request, rtt_str, 32);
     return snprintf(str, size, "%"PRIu64",%"PRIu64",%"PRIu64",%"PRIu64",%"PRIu64
                     ",%"PRIu64",%"PRIu64",%"PRIu64",%"PRIu64",%"PRIu64",cc:%"PRIu64
-                    ",rtx:%u,rtt:%s",
+                    ",rtx:%u,aqb:%"PRIu64",dqps:%"PRIu64",rqps:%"PRIu64",rtt:%s",
                     h3_request->h3_stream->stream_id,
                     xqc_calc_delay(stats.h3r_header_begin_time, create_time) / 1000,
                     xqc_calc_delay(stats.h3r_header_end_time, create_time) / 1000,
@@ -470,7 +500,9 @@ xqc_h3_request_stats_print(xqc_h3_request_t *h3_request, char *str, size_t size)
                     xqc_calc_delay(stats.h3r_body_send_time, create_time) / 1000,
                     xqc_calc_delay(stats.stream_fin_send_time, create_time) / 1000,
                     xqc_calc_delay(stats.stream_fin_ack_time, create_time) / 1000,
-                    stats.cwnd_blocked_ms, stats.retrans_cnt, rtt_str);
+                    stats.cwnd_blocked_ms, stats.retrans_cnt,
+                    stats.app_queued_bytes, stats.app_decrypt_qps, stats.app_reassemble_qps,
+                    rtt_str);
 }
 
 void
