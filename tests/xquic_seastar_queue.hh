@@ -68,6 +68,71 @@ public:
         return datagram;
     }
 
+    /*
+     * Coalesce consecutive datagrams that go to the same peer and have the
+     * same payload size into one merged buffer suitable for sendmsg with
+     * UDP_SEGMENT (GSO).
+     *
+     * Stops at the first datagram whose peer differs OR whose size differs
+     * from the first datagram's size. UDP_SEGMENT requires equal-sized
+     * segments (except optionally the last); we keep the simpler invariant
+     * "all equal" to avoid edge cases — most QUIC bursts naturally produce
+     * runs of same-size packets.
+     *
+     * If gso_enabled is false, callers should pass max_segments=1 so this
+     * behaves identically to pop().
+     */
+    struct GsoBatch {
+        seastar::socket_address peer;
+        seastar::temporary_buffer<char> merged_buf;
+        size_t segment_size = 0;
+        size_t segment_count = 0;
+    };
+
+    GsoBatch pop_gso_batch(size_t max_segments) {
+        GsoBatch batch;
+        if (_queue.empty() || max_segments == 0) {
+            return batch;
+        }
+
+        Datagram first = pop();
+        batch.peer = first.peer;
+        batch.segment_size = first.payload.size();
+        batch.segment_count = 1;
+
+        if (max_segments == 1 || _queue.empty()) {
+            // Fast path: just hand back the first datagram's buffer as-is
+            // (zero-copy). No merge needed.
+            batch.merged_buf = std::move(first.payload);
+            return batch;
+        }
+
+        // Pre-allocate worst-case merged buffer
+        seastar::temporary_buffer<char> merged(max_segments * batch.segment_size);
+        std::memcpy(merged.get_write(), first.payload.get(), batch.segment_size);
+        size_t total = batch.segment_size;
+
+        while (batch.segment_count < max_segments && !_queue.empty()) {
+            const Datagram& peek = _queue.front();
+            if (peek.payload.size() != batch.segment_size) break;
+            const auto& pa = peek.peer.as_posix_sockaddr();
+            const auto& fa = batch.peer.as_posix_sockaddr();
+            if (pa.sa_family != fa.sa_family) break;
+            socklen_t plen = peek.peer.length();
+            if (plen != batch.peer.length()) break;
+            if (std::memcmp(&pa, &fa, plen) != 0) break;
+
+            Datagram d = pop();
+            std::memcpy(merged.get_write() + total, d.payload.get(), d.payload.size());
+            total += d.payload.size();
+            batch.segment_count++;
+        }
+
+        merged.trim(total);
+        batch.merged_buf = std::move(merged);
+        return batch;
+    }
+
 private:
     size_t _capacity;
     std::deque<Datagram> _queue;

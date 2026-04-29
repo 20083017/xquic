@@ -18,6 +18,7 @@
 
 #include "platform.h"
 #include "user_conn.h"
+#include "xqc_socket_opts.h"
 #include <xquic/xqc_video_frame.h>
 #include <sys/stat.h>
 
@@ -42,7 +43,9 @@
 #include <iostream>
 #include <memory>
 #include <new>
+#include <limits>
 #include <stdexcept>
+#include <string>
 #include <utility>
 
 namespace bpo = boost::program_options;
@@ -53,6 +56,7 @@ using XqcHeadersPtr = std::unique_ptr<xqc_http_headers_t, decltype(&std::free)>;
 constexpr char kTransportAlpn[] = "transport";
 constexpr size_t kTransportFrameHeaderLen = 5;
 constexpr size_t kTransportPreviewLimit = 128;
+constexpr size_t kStreamBufferChunk = 64 * 1024;
 
 enum TransportDemoFrameType : uint8_t {
     XQC_TRANSPORT_DEMO_FRAME_HELLO = 0x01,
@@ -140,6 +144,8 @@ void release_user_stream(user_stream_t *user_stream) {
     user_stream->send_body = nullptr;
     user_stream->send_body_len = 0;
     user_stream->send_offset = 0;
+    user_stream->send_body_max = 0;
+    user_stream->send_fin_pending = 0;
     std::free(user_stream->recv_body);
     user_stream->recv_body = nullptr;
     user_stream->recv_body_len = 0;
@@ -148,6 +154,59 @@ void release_user_stream(user_stream_t *user_stream) {
         std::fclose(user_stream->recv_body_fp);
         user_stream->recv_body_fp = nullptr;
     }
+}
+
+size_t round_up_stream_capacity(size_t required) {
+    const size_t remainder = required % kStreamBufferChunk;
+    if (remainder == 0) {
+        return std::max(required, kStreamBufferChunk);
+    }
+    const size_t padding = kStreamBufferChunk - remainder;
+    if (required > std::numeric_limits<size_t>::max() - padding) {
+        return 0;
+    }
+    return required + padding;
+}
+
+void clear_send_buffer(user_stream_t *user_stream) {
+    std::free(user_stream->send_body);
+    user_stream->send_body = nullptr;
+    user_stream->send_body_len = 0;
+    user_stream->send_offset = 0;
+    user_stream->send_body_max = 0;
+    user_stream->send_fin_pending = 0;
+}
+
+bool has_pending_send(const user_stream_t *user_stream) {
+    return user_stream != nullptr
+        && (user_stream->send_offset < user_stream->send_body_len || user_stream->send_fin_pending);
+}
+
+bool ensure_stream_send_capacity(user_stream_t *user_stream, size_t extra_len) {
+    if (user_stream->send_body_len + extra_len <= user_stream->send_body_max) return true;
+    const size_t required = user_stream->send_body_len + extra_len;
+    size_t new_cap = user_stream->send_body_max == 0 ? round_up_stream_capacity(required) : user_stream->send_body_max;
+    if (new_cap == 0) return false;
+    while (new_cap < required) {
+        const size_t growth = std::max(new_cap / 2, kStreamBufferChunk);
+        if (new_cap > std::numeric_limits<size_t>::max() - growth) return false;
+        new_cap += growth;
+    }
+    void *new_buf = std::realloc(user_stream->send_body, new_cap);
+    if (new_buf == nullptr) return false;
+    user_stream->send_body = static_cast<char*>(new_buf);
+    user_stream->send_body_max = new_cap;
+    return true;
+}
+
+bool append_send_payload(user_stream_t *user_stream, const unsigned char *data, size_t data_len, bool fin) {
+    if (data_len > 0) {
+        if (!ensure_stream_send_capacity(user_stream, data_len)) return false;
+        std::memcpy(user_stream->send_body + user_stream->send_body_len, data, data_len);
+        user_stream->send_body_len += data_len;
+    }
+    if (fin) user_stream->send_fin_pending = 1;
+    return true;
 }
 
 std::string format_socket_address(const sockaddr *addr, socklen_t addr_len) {
@@ -170,8 +229,14 @@ std::string format_socket_address(const sockaddr *addr, socklen_t addr_len) {
 
 bool ensure_stream_recv_capacity(user_stream_t *user_stream, size_t extra_len) {
     if (user_stream->recv_body_len + extra_len <= user_stream->recv_body_cap) return true;
-    size_t new_cap = user_stream->recv_body_cap == 0 ? 65536 : user_stream->recv_body_cap;
-    while (new_cap < user_stream->recv_body_len + extra_len) new_cap *= 2;
+    const size_t required = user_stream->recv_body_len + extra_len;
+    size_t new_cap = user_stream->recv_body_cap == 0 ? round_up_stream_capacity(required) : user_stream->recv_body_cap;
+    if (new_cap == 0) return false;
+    while (new_cap < required) {
+        const size_t growth = std::max(new_cap / 2, kStreamBufferChunk);
+        if (new_cap > std::numeric_limits<size_t>::max() - growth) return false;
+        new_cap += growth;
+    }
     void *new_buf = std::realloc(user_stream->recv_body, new_cap);
     if (new_buf == nullptr) return false;
     user_stream->recv_body = static_cast<char*>(new_buf);
@@ -184,6 +249,72 @@ bool append_stream_payload(user_stream_t *user_stream, const unsigned char *data
     std::memcpy(user_stream->recv_body + user_stream->recv_body_len, data, data_len);
     user_stream->recv_body_len += data_len;
     return true;
+}
+
+void write_u32_be(unsigned char *out, uint32_t value) {
+    out[0] = static_cast<unsigned char>((value >> 24) & 0xff);
+    out[1] = static_cast<unsigned char>((value >> 16) & 0xff);
+    out[2] = static_cast<unsigned char>((value >> 8) & 0xff);
+    out[3] = static_cast<unsigned char>(value & 0xff);
+}
+
+size_t transport_frame_size(size_t payload_len) {
+    return kTransportFrameHeaderLen + payload_len;
+}
+
+char *append_transport_frame(char *out, uint8_t type, const char *data, size_t len) {
+    out[0] = static_cast<char>(type);
+    write_u32_be(reinterpret_cast<unsigned char*>(out + 1), static_cast<uint32_t>(len));
+    if (len > 0) {
+        std::memcpy(out + kTransportFrameHeaderLen, data, len);
+    }
+    return out + kTransportFrameHeaderLen + len;
+}
+
+xqc_int_t drain_stream_send_buffer(xqc_stream_t *stream, user_stream_t *user_stream) {
+    if (stream == nullptr || user_stream == nullptr) return -1;
+    while (user_stream->send_offset < user_stream->send_body_len) {
+        const size_t remaining = user_stream->send_body_len - user_stream->send_offset;
+        const ssize_t sent = xqc_stream_send(
+            stream,
+            reinterpret_cast<unsigned char*>(user_stream->send_body + user_stream->send_offset),
+            remaining,
+            user_stream->send_fin_pending ? 1 : 0);
+        if (sent == -XQC_EAGAIN) return 0;
+        if (sent < 0) return -1;
+        user_stream->send_offset += static_cast<size_t>(sent);
+        user_stream->total_sent += static_cast<size_t>(sent);
+    }
+    if (user_stream->send_fin_pending && user_stream->send_body_len == 0) {
+        const ssize_t sent = xqc_stream_send(stream, nullptr, 0, 1);
+        if (sent == -XQC_EAGAIN) return 0;
+        if (sent < 0) return -1;
+    }
+    clear_send_buffer(user_stream);
+    return 0;
+}
+
+xqc_int_t drain_h3_send_buffer(xqc_h3_request_t *req, user_stream_t *user_stream) {
+    if (req == nullptr || user_stream == nullptr) return -1;
+    while (user_stream->send_offset < user_stream->send_body_len) {
+        const size_t remaining = user_stream->send_body_len - user_stream->send_offset;
+        const ssize_t sent = xqc_h3_request_send_body(
+            req,
+            reinterpret_cast<unsigned char*>(user_stream->send_body + user_stream->send_offset),
+            remaining,
+            user_stream->send_fin_pending ? 1 : 0);
+        if (sent == -XQC_EAGAIN) return 0;
+        if (sent < 0) return -1;
+        user_stream->send_offset += static_cast<size_t>(sent);
+        user_stream->total_sent += static_cast<size_t>(sent);
+    }
+    if (user_stream->send_fin_pending && user_stream->send_body_len == 0) {
+        const ssize_t sent = xqc_h3_request_send_body(req, nullptr, 0, 1);
+        if (sent == -XQC_EAGAIN) return 0;
+        if (sent < 0) return -1;
+    }
+    clear_send_buffer(user_stream);
+    return 0;
 }
 
 uint32_t read_u32_be(const unsigned char *data) {
@@ -237,26 +368,36 @@ bool build_framed_response(xqc_stream_t *stream, user_stream_t *user_stream) {
     TransportDemoRequest request;
     const bool ok = parse_transport_demo_request(user_stream->recv_body, user_stream->recv_body_len, request);
     const std::string peer = format_socket_address(user_stream->user_conn->peer_addr, user_stream->user_conn->peer_addrlen);
-    std::string response;
-    append_transport_frame(response,
-        ok ? XQC_TRANSPORT_DEMO_FRAME_STATUS : XQC_TRANSPORT_DEMO_FRAME_ERROR,
-        ok ? std::string("ok") : request.error);
+    const std::string status = ok ? std::string("ok") : request.error;
     std::string stream_id_str = stream ? std::to_string(xqc_stream_id(stream)) : "h3";
     std::string info = "stream_id=" + stream_id_str + "\n"
         "peer=" + peer + "\n"
         "request_bytes=" + std::to_string(user_stream->recv_body_len) + "\n"
         "request_frames=" + std::to_string(request.frame_count) + "\n";
-    append_transport_frame(response, XQC_TRANSPORT_DEMO_FRAME_INFO, info);
-    if (ok) {
-        append_transport_frame(response, XQC_TRANSPORT_DEMO_FRAME_RESULT, request.message);
+    const size_t status_len = status.size();
+    const size_t info_len = info.size();
+    const size_t result_len = ok ? request.message.size() : 0;
+    if (status_len > std::numeric_limits<uint32_t>::max()
+        || info_len > std::numeric_limits<uint32_t>::max()
+        || result_len > std::numeric_limits<uint32_t>::max()) {
+        return false;
     }
-    auto buffer = static_cast<char*>(std::malloc(response.size()));
-    if (!buffer) return false;
-    std::memcpy(buffer, response.data(), response.size());
-    std::free(user_stream->send_body);
-    user_stream->send_body = buffer;
-    user_stream->send_body_len = response.size();
+    const size_t total_size = transport_frame_size(status_len)
+        + transport_frame_size(info_len)
+        + (ok ? transport_frame_size(result_len) : 0);
+    clear_send_buffer(user_stream);
+    if (!ensure_stream_send_capacity(user_stream, total_size)) return false;
+    char *cursor = user_stream->send_body;
+    cursor = append_transport_frame(cursor,
+        ok ? XQC_TRANSPORT_DEMO_FRAME_STATUS : XQC_TRANSPORT_DEMO_FRAME_ERROR,
+        status.data(), status_len);
+    cursor = append_transport_frame(cursor, XQC_TRANSPORT_DEMO_FRAME_INFO, info.data(), info_len);
+    if (ok) {
+        cursor = append_transport_frame(cursor, XQC_TRANSPORT_DEMO_FRAME_RESULT, request.message.data(), result_len);
+    }
+    user_stream->send_body_len = total_size;
     user_stream->send_offset = 0;
+    user_stream->send_fin_pending = 1;
     return true;
 }
 
@@ -422,37 +563,51 @@ seastar::future<> XquicSeastarServerEbpf::start_service(uint16_t port, const std
          *   - Same as original: shard 0 receives, routes via submit_to.
          */
         if (_reuseport_fd >= 0) {
-            /* eBPF mode: wrap the pre-created reuseport socket into Seastar */
+            /* eBPF mode: take ownership of the pre-created reuseport FD via
+             * Seastar's pollable_fd. This bypasses udp_channel entirely so we
+             * have direct recvmsg/sendmsg control (and access to msg_control
+             * for UDP_GRO/UDP_SEGMENT in later PRs). */
             _ebpf_mode = true;
             _fallback_posix = false;
 
-            /*
-             * Create a Seastar UDP channel from the raw file descriptor.
-             * Seastar POSIX stack supports make_bound_datagram_channel with
-             * an existing FD via seastar::file_desc::from_fd().
-             */
-            seastar::socket_address bind_addr = seastar::make_ipv4_address(seastar::ipv4_addr(port));
-            _udp_channel.emplace(
-                seastar::engine().net().make_bound_datagram_channel(bind_addr));
+            /* Cache local bind address for engine_packet_process. recvmsg
+             * without IP_PKTINFO doesn't return the local addr, so we
+             * synthesize it from the bound port. */
+            std::memset(&_ebpf_local_addr, 0, sizeof(_ebpf_local_addr));
+            auto* la4 = reinterpret_cast<struct sockaddr_in*>(&_ebpf_local_addr);
+            la4->sin_family = AF_INET;
+            la4->sin_addr.s_addr = htonl(INADDR_ANY);
+            la4->sin_port = htons(_port);
+            _ebpf_local_addrlen = sizeof(struct sockaddr_in);
 
-            /*
-             * Close the Seastar-created socket and replace FD with our reuseport one.
-             * NOTE: This is a workaround — Seastar's POSIX datagram channel
-             * internally wraps a pollable_fd. We close the auto-created one
-             * and dup2() our reuseport FD over it.
-             *
-             * ALTERNATIVE APPROACH: We use Seastar's pollable_fd directly.
-             * For the initial eBPF evaluation, we accept the overhead of
-             * creating+closing an extra socket per shard.
-             */
-            /* For now, just use Seastar's own bound channel per shard.
-             * In POSIX stack, this won't bind multiple sockets to the same port
-             * unless SO_REUSEPORT is set. So we rely on the pre-created FDs
-             * and use a raw POSIX recv loop integrated with Seastar's reactor. */
+            /* Wrap raw FD into pollable_fd. file_desc takes ownership and
+             * will close() on destruction; we set _reuseport_fd = -1 to
+             * prevent any double-close from external paths. */
+            int fd = _reuseport_fd;
+            _reuseport_fd = -1;
+
+            /* PR3: enable UDP_GRO so recvmsg returns coalesced chunks with
+             * SOL_UDP/UDP_GRO cmsg providing per-segment size. Apply
+             * perf opts again in case the FD was created without them
+             * (idempotent setsockopt). */
+            xqc_apply_udp_perf_opts(fd, AF_INET, /*is_server=*/1);
+            int gro_ret = xqc_enable_udp_gro(fd);
+            _gso_enabled = (gro_ret == 0);  /* If GRO works, GSO usually does too */
+
+            /* Bench knob: allow disabling GSO at runtime to compare CPU/throughput.
+             * Set XQC_DISABLE_GSO=1 (or any non-empty non-"0" value) to force off. */
+            if (const char* env = std::getenv("XQC_DISABLE_GSO");
+                env && env[0] && !(env[0] == '0' && env[1] == '\0')) {
+                _gso_enabled = false;
+                std::cout << "[shard " << seastar::this_shard_id()
+                          << "] GSO disabled via XQC_DISABLE_GSO" << std::endl;
+            }
+
+            _ebpf_pfd.emplace(seastar::file_desc::from_fd(fd));
 
             _receive_loop.emplace(
                 seastar::with_gate(_background_ops, [this] {
-                    return run_receive_loop();
+                    return run_ebpf_receive_loop();
                 }).handle_exception([this](std::exception_ptr ep) {
                     if (_stopping) return seastar::make_ready_future<>();
                     return seastar::make_exception_future<>(ep);
@@ -498,6 +653,16 @@ seastar::future<> XquicSeastarServerEbpf::start_service(uint16_t port, const std
             _udp_channel->close();
             _udp_channel.reset();
         }
+        if (_ebpf_pfd) {
+            try { _ebpf_pfd->shutdown(SHUT_RDWR); } catch (...) {}
+            _ebpf_pfd.reset();
+        }
+        /* If init() failed before transferring _reuseport_fd into
+         * _ebpf_pfd, close it here to avoid a leak. */
+        if (_reuseport_fd >= 0) {
+            ::close(_reuseport_fd);
+            _reuseport_fd = -1;
+        }
         if (_engine != nullptr) {
             xqc_engine_destroy(_engine);
             _engine = nullptr;
@@ -515,6 +680,10 @@ seastar::future<> XquicSeastarServerEbpf::stop() {
     if (_udp_channel) {
         _udp_channel->shutdown_input();
         _udp_channel->shutdown_output();
+    }
+    if (_ebpf_pfd) {
+        /* Wake up any pending recvmsg/sendmsg so the receive loop exits. */
+        try { _ebpf_pfd->shutdown(SHUT_RDWR); } catch (...) {}
     }
 
     seastar::future<> receive_loop = seastar::make_ready_future<>();
@@ -534,6 +703,9 @@ seastar::future<> XquicSeastarServerEbpf::stop() {
             if (_udp_channel) {
                 _udp_channel->close();
                 _udp_channel.reset();
+            }
+            if (_ebpf_pfd) {
+                _ebpf_pfd.reset();  /* file_desc dtor closes the fd */
             }
             if (_engine != nullptr) {
                 xqc_engine_destroy(_engine);
@@ -564,6 +736,94 @@ seastar::future<> XquicSeastarServerEbpf::run_receive_loop() {
             }
             return seastar::make_exception_future<seastar::stop_iteration>(ep);
         });
+    });
+}
+
+/*
+ * eBPF mode receive loop: bypasses udp_channel and uses pollable_fd::recvmsg
+ * directly so we can read SOL_UDP/UDP_GRO ancillary data and split coalesced
+ * receives into per-QUIC-packet slices.
+ */
+seastar::future<> XquicSeastarServerEbpf::run_ebpf_receive_loop() {
+    return seastar::repeat([this]() {
+        if (_stopping || !_ebpf_pfd) {
+            return seastar::make_ready_future<seastar::stop_iteration>(seastar::stop_iteration::yes);
+        }
+
+        struct RecvCtx {
+            char buf[64 * 1024];
+            struct sockaddr_storage peer;
+            struct iovec iov;
+            char cbuf[CMSG_SPACE(sizeof(uint16_t)) + CMSG_SPACE(64)];  // gso + padding
+            struct msghdr msg;
+        };
+        auto ctx = std::make_unique<RecvCtx>();
+        std::memset(&ctx->peer, 0, sizeof(ctx->peer));
+        ctx->iov.iov_base = ctx->buf;
+        ctx->iov.iov_len = sizeof(ctx->buf);
+        std::memset(&ctx->cbuf, 0, sizeof(ctx->cbuf));
+        std::memset(&ctx->msg, 0, sizeof(ctx->msg));
+        ctx->msg.msg_name = &ctx->peer;
+        ctx->msg.msg_namelen = sizeof(ctx->peer);
+        ctx->msg.msg_iov = &ctx->iov;
+        ctx->msg.msg_iovlen = 1;
+        ctx->msg.msg_control = ctx->cbuf;
+        ctx->msg.msg_controllen = sizeof(ctx->cbuf);
+
+        auto* msg_ptr = &ctx->msg;
+        return _ebpf_pfd->recvmsg(msg_ptr).then_wrapped(
+            [this, ctx = std::move(ctx)](seastar::future<size_t> f) mutable {
+                if (_stopping) {
+                    return seastar::stop_iteration::yes;
+                }
+                if (f.failed()) {
+                    try {
+                        std::rethrow_exception(f.get_exception());
+                    } catch (const std::exception& ex) {
+                        std::cerr << "[xquic-ebpf] recvmsg: " << ex.what() << std::endl;
+                    } catch (...) {
+                        std::cerr << "[xquic-ebpf] recvmsg unknown exception" << std::endl;
+                    }
+                    return seastar::stop_iteration::no;
+                }
+                size_t n = f.get();
+                if (n == 0) {
+                    return seastar::stop_iteration::no;
+                }
+                if (_engine == nullptr) {
+                    return seastar::stop_iteration::no;
+                }
+
+                /* Parse SOL_UDP/UDP_GRO cmsg for per-segment size; if absent,
+                 * the whole buffer is one packet. */
+                uint16_t gso_size = 0;
+                for (struct cmsghdr* cm = CMSG_FIRSTHDR(&ctx->msg); cm != nullptr;
+                     cm = CMSG_NXTHDR(&ctx->msg, cm)) {
+                    if (cm->cmsg_level == SOL_UDP && cm->cmsg_type == UDP_GRO) {
+                        std::memcpy(&gso_size, CMSG_DATA(cm), sizeof(gso_size));
+                        break;
+                    }
+                }
+                if (gso_size == 0 || gso_size > n) {
+                    gso_size = static_cast<uint16_t>(n);
+                }
+
+                _stats.packets_recv++;
+                _stats.bytes_recv += n;
+
+                socklen_t peer_len = ctx->msg.msg_namelen;
+                size_t off = 0;
+                while (off < n) {
+                    size_t seg = std::min<size_t>(gso_size, n - off);
+                    process_packet_local(
+                        reinterpret_cast<const unsigned char*>(ctx->buf) + off, seg,
+                        ctx->peer, peer_len,
+                        _ebpf_local_addr, _ebpf_local_addrlen);
+                    off += seg;
+                }
+
+                return seastar::stop_iteration::no;
+            });
     });
 }
 
@@ -712,7 +972,11 @@ ssize_t XquicSeastarServerEbpf::enqueue_send(const unsigned char *buf, size_t si
 
 void XquicSeastarServerEbpf::schedule_send_flush() {
     if (_stopping || _send_flush_in_progress || _send_integration.empty()) return;
-    if (!_udp_channel) return;
+    if (_ebpf_mode) {
+        if (!_ebpf_pfd) return;
+    } else {
+        if (!_udp_channel) return;
+    }
 
     _send_flush_in_progress = true;
     (void)seastar::with_gate(_background_ops, [this] {
@@ -738,6 +1002,12 @@ void XquicSeastarServerEbpf::schedule_send_flush() {
 seastar::future<> XquicSeastarServerEbpf::flush_send_queue() {
     if (_stopping) return seastar::make_ready_future<>();
     try {
+        if (_ebpf_mode && _ebpf_pfd) {
+            /* PR3: GSO-aware flush; helper will reset _gso_enabled to false
+             * if the kernel/NIC reports unsupported on first failure. */
+            return _send_integration.flush_to_pollable_fd_with_gso(
+                *_ebpf_pfd, _gso_enabled);
+        }
         auto& ch = get_send_channel();
         return _send_integration.flush_to(ch).then([] {});
     } catch (const std::exception& ex) {
@@ -765,20 +1035,14 @@ void XquicSeastarServerEbpf::send_h3_response(user_stream_t *user_stream) {
         .headers = resp_headers,
         .count = sizeof(resp_headers) / sizeof(resp_headers[0]),
     };
-    xqc_h3_request_send_headers(req, &response_headers, 0);
-    user_stream->header_sent = 1;
-    _stats.h3_responses++;
+    if (!user_stream->header_sent) {
+        xqc_h3_request_send_headers(req, &response_headers, 0);
+        user_stream->header_sent = 1;
+        _stats.h3_responses++;
+    }
 
-    if (user_stream->send_body && user_stream->send_body_len > 0) {
-        xqc_h3_request_send_body(req,
-            reinterpret_cast<unsigned char*>(user_stream->send_body),
-            user_stream->send_body_len, 1);
-        user_stream->total_sent += user_stream->send_body_len;
-        std::free(user_stream->send_body);
-        user_stream->send_body = nullptr;
-        user_stream->send_body_len = 0;
-    } else {
-        xqc_h3_request_send_body(req, nullptr, 0, 1);
+    if (drain_h3_send_buffer(req, user_stream) < 0) {
+        std::cerr << "[xquic-ebpf] send_h3_response: send body failed" << std::endl;
     }
 }
 
@@ -847,18 +1111,8 @@ xqc_int_t XquicSeastarServerEbpf::on_stream_create_notify(xqc_stream_t *stream, 
 
 xqc_int_t XquicSeastarServerEbpf::on_stream_write_notify(xqc_stream_t *stream, void *user_data) {
     auto *user_stream = static_cast<user_stream_t*>(user_data);
-    if (user_stream == nullptr) return 0;
-    if (user_stream->send_body && user_stream->send_offset < user_stream->send_body_len) {
-        size_t remaining = user_stream->send_body_len - user_stream->send_offset;
-        ssize_t sent = xqc_stream_send(stream,
-            reinterpret_cast<unsigned char*>(user_stream->send_body + user_stream->send_offset),
-            remaining, 1);
-        if (sent > 0) {
-            user_stream->send_offset += static_cast<size_t>(sent);
-            user_stream->total_sent += static_cast<size_t>(sent);
-        }
-    }
-    return 0;
+    if (user_stream == nullptr || !has_pending_send(user_stream)) return 0;
+    return drain_stream_send_buffer(stream, user_stream);
 }
 
 xqc_int_t XquicSeastarServerEbpf::on_stream_read_notify(xqc_stream_t *stream, void *user_data) {
@@ -874,6 +1128,11 @@ xqc_int_t XquicSeastarServerEbpf::on_stream_read_notify(xqc_stream_t *stream, vo
         _stats.streams_created++;
     }
 
+    if (has_pending_send(user_stream)) {
+        const xqc_int_t pending_rc = drain_stream_send_buffer(stream, user_stream);
+        if (pending_rc != 0 || has_pending_send(user_stream)) return pending_rc;
+    }
+
     unsigned char buf[65536];
     unsigned char fin = 0;
     while (true) {
@@ -882,28 +1141,32 @@ xqc_int_t XquicSeastarServerEbpf::on_stream_read_notify(xqc_stream_t *stream, vo
         user_stream->total_recvd += static_cast<size_t>(read);
 
         if (_video_mode) {
-            append_stream_payload(user_stream, buf, static_cast<size_t>(read));
+            if (!append_stream_payload(user_stream, buf, static_cast<size_t>(read))) return -1;
             process_video_frames(user_stream, _video_output_dir);
             _stats.video_bytes_recvd += static_cast<size_t>(read);
         } else if (_echo_mode) {
-            xqc_stream_send(stream, buf, static_cast<size_t>(read), fin ? 1 : 0);
-            user_stream->total_sent += static_cast<size_t>(read);
+            size_t offset = 0;
+            while (offset < static_cast<size_t>(read)) {
+                const int send_fin = fin ? 1 : 0;
+                const ssize_t sent = xqc_stream_send(stream, buf + offset, static_cast<size_t>(read) - offset, send_fin);
+                if (sent == -XQC_EAGAIN) {
+                    if (!append_send_payload(user_stream, buf + offset, static_cast<size_t>(read) - offset, send_fin != 0)) {
+                        return -1;
+                    }
+                    return 0;
+                }
+                if (sent < 0) return -1;
+                offset += static_cast<size_t>(sent);
+                user_stream->total_sent += static_cast<size_t>(sent);
+            }
         } else {
-            append_stream_payload(user_stream, buf, static_cast<size_t>(read));
+            if (!append_stream_payload(user_stream, buf, static_cast<size_t>(read))) return -1;
         }
 
         if (fin) {
             if (!_echo_mode && !_video_mode) {
-                build_framed_response(stream, user_stream);
-                if (user_stream->send_body && user_stream->send_body_len > 0) {
-                    ssize_t sent = xqc_stream_send(stream,
-                        reinterpret_cast<unsigned char*>(user_stream->send_body),
-                        user_stream->send_body_len, 1);
-                    if (sent > 0) {
-                        user_stream->send_offset += static_cast<size_t>(sent);
-                        user_stream->total_sent += static_cast<size_t>(sent);
-                    }
-                }
+                if (!build_framed_response(stream, user_stream)) return -1;
+                return drain_stream_send_buffer(stream, user_stream);
             }
             if (_video_mode) {
                 _stats.video_streams_finished++;
@@ -954,16 +1217,7 @@ xqc_int_t XquicSeastarServerEbpf::on_h3_request_write_notify(xqc_h3_request_t *r
     auto *user_stream = static_cast<user_stream_t*>(user_data);
     if (user_stream == nullptr) return 0;
 
-    if (user_stream->send_body && user_stream->send_offset < user_stream->send_body_len && user_stream->header_sent) {
-        size_t remaining = user_stream->send_body_len - user_stream->send_offset;
-        ssize_t sent = xqc_h3_request_send_body(req,
-            reinterpret_cast<unsigned char*>(user_stream->send_body + user_stream->send_offset),
-            remaining, 1);
-        if (sent > 0) {
-            user_stream->send_offset += static_cast<size_t>(sent);
-            user_stream->total_sent += static_cast<size_t>(sent);
-        }
-    }
+    if (has_pending_send(user_stream)) return drain_h3_send_buffer(req, user_stream);
     return 0;
 }
 
@@ -971,6 +1225,11 @@ xqc_int_t XquicSeastarServerEbpf::on_h3_request_read_notify(xqc_h3_request_t *re
                                                               xqc_request_notify_flag_t flag, void *user_data) {
     auto *user_stream = static_cast<user_stream_t*>(user_data);
     if (user_stream == nullptr) return -1;
+
+    if (has_pending_send(user_stream)) {
+        const xqc_int_t pending_rc = drain_h3_send_buffer(req, user_stream);
+        if (pending_rc != 0 || has_pending_send(user_stream)) return pending_rc;
+    }
 
     if (flag & XQC_REQ_NOTIFY_READ_HEADER) {
         uint8_t fin = 0;
@@ -987,15 +1246,27 @@ xqc_int_t XquicSeastarServerEbpf::on_h3_request_read_notify(xqc_h3_request_t *re
             user_stream->total_recvd += static_cast<size_t>(read);
 
             if (_echo_mode) {
-                xqc_h3_request_send_body(req, body, static_cast<size_t>(read), fin ? 1 : 0);
-                user_stream->total_sent += static_cast<size_t>(read);
+                size_t offset = 0;
+                while (offset < static_cast<size_t>(read)) {
+                    const int send_fin = fin ? 1 : 0;
+                    const ssize_t sent = xqc_h3_request_send_body(req, body + offset, static_cast<size_t>(read) - offset, send_fin);
+                    if (sent == -XQC_EAGAIN) {
+                        if (!append_send_payload(user_stream, body + offset, static_cast<size_t>(read) - offset, send_fin != 0)) {
+                            return -1;
+                        }
+                        return 0;
+                    }
+                    if (sent < 0) return -1;
+                    offset += static_cast<size_t>(sent);
+                    user_stream->total_sent += static_cast<size_t>(sent);
+                }
             } else {
-                append_stream_payload(user_stream, body, static_cast<size_t>(read));
+                if (!append_stream_payload(user_stream, body, static_cast<size_t>(read))) return -1;
             }
 
             if (fin) {
                 if (!_echo_mode) {
-                    build_framed_response(nullptr, user_stream);
+                    if (!build_framed_response(nullptr, user_stream)) return -1;
                     send_h3_response(user_stream);
                 }
                 break;
@@ -1007,7 +1278,7 @@ xqc_int_t XquicSeastarServerEbpf::on_h3_request_read_notify(xqc_h3_request_t *re
         if (_echo_mode) {
             xqc_h3_request_send_body(req, nullptr, 0, 1);
         } else {
-            build_framed_response(nullptr, user_stream);
+            if (!build_framed_response(nullptr, user_stream)) return -1;
             send_h3_response(user_stream);
         }
     }
@@ -1272,12 +1543,19 @@ int main(int argc, char **argv) {
             });
         }).finally([ebpf_dispatch] {
             return server.stop().then([ebpf_dispatch] {
-                if (ebpf_dispatch) {
-                    /* Close reuseport sockets */
-                    for (int fd : ebpf_dispatch->fds()) {
-                        close(fd);
-                    }
-                }
+                /*
+                 * NOTE: ebpf_dispatch->fds() are NOT closed here.
+                 * Per-shard XquicSeastarServerEbpf::init() wraps each FD
+                 * into a seastar::pollable_fd which takes ownership; the
+                 * file_desc destructor closes them. Closing again here
+                 * would be a double-close (and may close an unrelated
+                 * recycled fd).
+                 *
+                 * If init() fails before transferring ownership, init's
+                 * own catch block closes the fd. The only leak path is
+                 * an uncaught hard abort, which is acceptable.
+                 */
+                (void)ebpf_dispatch;
             });
         });
     });

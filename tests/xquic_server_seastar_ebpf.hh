@@ -7,6 +7,7 @@
 #include <seastar/core/distributed.hh>
 #include <seastar/core/future.hh>
 #include <seastar/core/gate.hh>
+#include <seastar/core/internal/pollable_fd.hh>
 #include <seastar/core/posix.hh>
 #include <seastar/core/reactor.hh>
 #include <seastar/core/sharded.hh>
@@ -86,6 +87,17 @@ private:
     bool _ebpf_mode;    /* true if eBPF reuseport is active */
     bool _fallback_posix;  /* true if degraded to shard-0-only POSIX */
     int _reuseport_fd;  /* pre-created reuseport socket fd, or -1 */
+    /*
+     * In eBPF mode, _reuseport_fd is wrapped into _ebpf_pfd and the FD
+     * ownership is transferred (we set _reuseport_fd = -1 after wrap).
+     * recvmsg/sendmsg go through this pollable_fd directly, bypassing
+     * Seastar's udp_channel and giving us access to msg_control (cmsg).
+     */
+    std::optional<seastar::pollable_fd> _ebpf_pfd;
+    struct sockaddr_storage _ebpf_local_addr {};
+    socklen_t _ebpf_local_addrlen = 0;
+    bool _gso_enabled = false;       /* set to true in init() after setsockopt success;
+                                       cleared on first kernel/NIC unsupported error */
     seastar::distributed<XquicSeastarServerEbpf> *_distributed = nullptr;
 
     struct Stats {
@@ -109,6 +121,7 @@ private:
 
     void init_xquic_engine();
     seastar::future<> run_receive_loop();
+    seastar::future<> run_ebpf_receive_loop();
     void on_datagram(seastar::net::udp_datagram& datagram);
     void process_packet_local(const unsigned char *data, size_t len,
                               struct sockaddr_storage& peer_addr, socklen_t peer_len,
