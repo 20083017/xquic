@@ -111,32 +111,45 @@ if(XQC_ENABLE_SEASTAR_EXAMPLE)
 
     target_compile_features(xquic_server_seastar PRIVATE cxx_std_20)
 
-    target_link_libraries(xquic_server_seastar
-        PRIVATE
-        xquic-static
-        ${SEASTAR_LINK_TARGET}
-        ${SSL_LIB_PATH}
-        m
-        dl
-        pthread
-    )
+    if(CMAKE_SYSTEM_NAME MATCHES "Windows")
+        # Seastar::seastar should propagate Winsock / BCrypt etc.; do not link
+        # POSIX-only libs (m, dl, pthread) on Windows.
+        target_link_libraries(xquic_server_seastar
+            PRIVATE
+            xquic-static
+            ${SEASTAR_LINK_TARGET}
+            ${SSL_LIB_PATH}
+        )
+    else()
+        target_link_libraries(xquic_server_seastar
+            PRIVATE
+            xquic-static
+            ${SEASTAR_LINK_TARGET}
+            ${SSL_LIB_PATH}
+            m
+            dl
+            pthread
+        )
+    endif()
 
-    # POSIX + eBPF reuseport variant (Phase 4 evaluation)
-    add_executable(xquic_server_seastar_ebpf
-        xquic_server_seastar_ebpf.cpp
-    )
+    # POSIX + eBPF reuseport variant (Linux-only; not built on Windows)
+    if(NOT CMAKE_SYSTEM_NAME MATCHES "Windows")
+        add_executable(xquic_server_seastar_ebpf
+            xquic_server_seastar_ebpf.cpp
+        )
 
-    target_compile_features(xquic_server_seastar_ebpf PRIVATE cxx_std_20)
+        target_compile_features(xquic_server_seastar_ebpf PRIVATE cxx_std_20)
 
-    target_link_libraries(xquic_server_seastar_ebpf
-        PRIVATE
-        xquic-static
-        ${SEASTAR_LINK_TARGET}
-        ${SSL_LIB_PATH}
-        m
-        dl
-        pthread
-    )
+        target_link_libraries(xquic_server_seastar_ebpf
+            PRIVATE
+            xquic-static
+            ${SEASTAR_LINK_TARGET}
+            ${SSL_LIB_PATH}
+            m
+            dl
+            pthread
+        )
+    endif()
 endif()
 
 

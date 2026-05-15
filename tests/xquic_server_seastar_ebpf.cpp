@@ -28,7 +28,10 @@
 #include <seastar/core/loop.hh>
 #include <seastar/core/reactor.hh>
 #include <seastar/core/sleep.hh>
+#include <seastar/core/abort_source.hh>
+#include <seastar/core/signal.hh>
 #include <seastar/core/smp.hh>
+#include <csignal>
 
 #include <boost/program_options.hpp>
 
@@ -1524,6 +1527,68 @@ int main(int argc, char **argv) {
 
         static seastar::sharded<XquicSeastarServerEbpf> server;
 
+        /*
+         * Register sharded::stop() as an at_exit handler.
+         *
+         * Why not .finally(server.stop()) on the main future chain?
+         *   The default SIGINT/SIGTERM handler installed by app_template
+         *   calls seastar::engine().exit(), which abruptly tears the
+         *   reactor down without necessarily letting an outstanding
+         *   keep_doing()'s .finally() run on a reactor thread. The
+         *   sharded<> object is then destroyed from the static destructor
+         *   on the main thread, where _instances is still non-empty,
+         *   firing assert(_instances.empty()) and SIGABRT'ing the process.
+         *
+         *   engine().at_exit() callbacks are explicitly run and awaited
+         *   by the reactor *before* it returns from app.run(), so
+         *   server.stop() is guaranteed to complete and clear _instances
+         *   prior to any static destruction.
+         *
+         * NOTE: ebpf_dispatch->fds() are NOT closed in the cleanup
+         * handler. Per-shard XquicSeastarServerEbpf::init() wraps each
+         * FD into a seastar::pollable_fd which takes ownership; the
+         * file_desc destructor closes them. Closing again here would be
+         * a double-close (and may close an unrelated recycled fd).
+         */
+        seastar::engine().at_exit([] {
+            return server.stop();
+        });
+
+        /*
+         * Explicit shutdown waiter.
+         *
+         * We previously used keep_doing(sleep(24h)) to keep the main
+         * future alive — but seastar::sleep() returns a future that
+         * will not resolve until its timer fires, even after
+         * engine().exit() flips _stopping. As a result the outer
+         * future never returned, at_exit() callbacks never ran, and
+         * sharded<>::~sharded() asserted on a still-populated
+         * _instances vector during static destruction.
+         *
+         * Instead we wait on an abortable source. SIGINT/SIGTERM
+         * handlers request_abort() on it; sleep_abortable() returns
+         * with sleep_aborted, the chain unwinds normally, then
+         * at_exit runs server.stop() and the reactor exits cleanly.
+         *
+         * app_template installs a SIGINT handler by default, but we
+         * register both signals here so the abort source — not just
+         * the reactor — is notified, and so SIGTERM (used by bench
+         * scripts) is honoured.
+         */
+        static seastar::abort_source shutdown_as;
+        seastar::handle_signal(SIGINT, [] {
+            std::cerr << "[main] SIGINT received" << std::endl;
+            if (!shutdown_as.abort_requested()) {
+                shutdown_as.request_abort();
+            }
+        });
+        seastar::handle_signal(SIGTERM, [] {
+            std::cerr << "[main] SIGTERM received" << std::endl;
+            if (!shutdown_as.abort_requested()) {
+                shutdown_as.request_abort();
+            }
+        });
+
         return server.start().then([port, cert, key, echo, video, vdir, ebpf_ok, ebpf_dispatch] {
             return server.invoke_on_all([port, cert, key, echo, video, vdir, ebpf_ok, ebpf_dispatch]
                                         (XquicSeastarServerEbpf &s) {
@@ -1536,27 +1601,13 @@ int main(int argc, char **argv) {
 
                 return s.start_service(port, cert, key, echo, video, vdir);
             });
-        }).then([] {
+        }).then([ebpf_dispatch] {
+            (void)ebpf_dispatch;  /* keep handle alive until shutdown */
             std::cout << "Seastar XQUIC eBPF server ready (" << seastar::smp::count << " shards)" << std::endl;
-            return seastar::keep_doing([] {
-                return seastar::sleep(std::chrono::hours(24));
-            });
-        }).finally([ebpf_dispatch] {
-            return server.stop().then([ebpf_dispatch] {
-                /*
-                 * NOTE: ebpf_dispatch->fds() are NOT closed here.
-                 * Per-shard XquicSeastarServerEbpf::init() wraps each FD
-                 * into a seastar::pollable_fd which takes ownership; the
-                 * file_desc destructor closes them. Closing again here
-                 * would be a double-close (and may close an unrelated
-                 * recycled fd).
-                 *
-                 * If init() fails before transferring ownership, init's
-                 * own catch block closes the fd. The only leak path is
-                 * an uncaught hard abort, which is acceptable.
-                 */
-                (void)ebpf_dispatch;
-            });
+            return seastar::sleep_abortable(std::chrono::hours(24 * 365), shutdown_as)
+                .handle_exception_type([] (const seastar::sleep_aborted &) {
+                    std::cout << "[main] shutdown signal received, stopping..." << std::endl;
+                });
         });
     });
 }

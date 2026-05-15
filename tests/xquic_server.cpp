@@ -1,6 +1,7 @@
 // xquic_server.cpp
 #include "xquic_server.h"
 #include "user_conn.h"
+#include "xqc_socket_opts.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -235,23 +236,38 @@ int XquicServer::init(int argc, char *argv[]) {
     
     listen_fd_ = socket(AF_INET, SOCK_DGRAM, 0);
     if (listen_fd_ < 0) return -1;
-    
+
     int opt = 1;
     setsockopt(listen_fd_, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+    /* UDP performance / correctness tuning (POSIX stack):
+     *   - large RCV/SND buffers to absorb bursts
+     *   - DF=1 + IP_RECVERR so QUIC PMTUD works
+     *   - IP_PKTINFO so multi-IP wildcard binds reply with the right src IP
+     * See tests/xqc_socket_opts.h for details. */
+    xqc_apply_udp_perf_opts(listen_fd_, AF_INET, /*server=*/1);
 
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
     addr.sin_port = htons(port_);
     addr.sin_addr.s_addr = INADDR_ANY;
-    
+
     if (bind(listen_fd_, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
         close(listen_fd_);
         return -1;
     }
-    
+
     fcntl(listen_fd_, F_SETFL, O_NONBLOCK);
-    
+
+    /* Enable kernel UDP_GRO (no-op on kernels < 5.0); receive path uses
+     * recvmsg + segment slicing in process_socket_read(). */
+    xqc_enable_udp_gro(listen_fd_);
+
+    /* Init the send-side coalescer; flushed at the end of each recv
+     * burst and after every engine timer tick. */
+    xqc_udp_writer_init(&writer_, listen_fd_);
+
     ev_listen_ = event_new(event_base_, listen_fd_, EV_READ | EV_PERSIST, xqc_server_socket_trampoline, this);
     event_add(ev_listen_, NULL);
 
@@ -505,13 +521,17 @@ void XquicServer::set_event_timer(xqc_msec_t wake_after) {
 
 ssize_t XquicServer::write_socket(const unsigned char *buf, size_t size, const struct sockaddr *peer_addr, socklen_t peer_addrlen, user_conn_t *user_conn) {
     if (!user_conn || user_conn->socket < 0) return -1;
-    return sendto(user_conn->socket, buf, size, 0, peer_addr, peer_addrlen);
+    /* Coalesce into the per-server writer; the recv loop / engine timer
+     * will flush before returning to libevent. */
+    return xqc_udp_writer_enqueue(&writer_, buf, size, peer_addr, peer_addrlen);
 }
 
 void XquicServer::on_engine_timer() {
     if (engine_) {
         xqc_engine_main_logic(engine_);
     }
+    /* The engine may have produced packets; push them out now. */
+    xqc_udp_writer_flush(&writer_);
 }
 
 void XquicServer::on_socket_event(int fd, short what) {
@@ -521,28 +541,49 @@ void XquicServer::on_socket_event(int fd, short what) {
 }
 
 void XquicServer::process_socket_read() {
-    struct sockaddr_storage peer_addr;
-    socklen_t peer_addrlen = sizeof(peer_addr);
-    unsigned char buf[4096];
-    
-    ssize_t n = recvfrom(listen_fd_, buf, sizeof(buf), 0, (struct sockaddr*)&peer_addr, &peer_addrlen);
-    if (n < 0) return;
+    /* Buffer must accommodate one GRO-coalesced batch. UDP datagrams
+     * are <= 64 KiB; with GRO the kernel still caps payload at 64 KiB. */
+    unsigned char buf[64 * 1024];
+    xqc_udp_recv_segments_t segs;
 
-    // Use a stack-allocated structure to avoid memory leaks.
-    // The engine may use this user_data for writing back packets before the connection
-    // is fully established and conn_create_notify is called.
-    // Once the connection is established, the engine will use the user_data
-    // set by xqc_conn_set_transport_user_data in on_conn_create_notify.
-    user_conn_t temp_user_conn;
-    memset(&temp_user_conn, 0, sizeof(user_conn_t));
-    temp_user_conn.server = this;
-    temp_user_conn.socket = listen_fd_;
+    /* Drain the kernel queue in a loop so we benefit from GRO without
+     * extra epoll wakeups. */
+    for (;;) {
+        ssize_t n = xqc_udp_recvmsg_gro(listen_fd_, buf, sizeof(buf), &segs);
+        if (n <= 0) break;
 
-    if (engine_) {
-        xqc_engine_packet_process(engine_, buf, n, 
-                                  (struct sockaddr*)&peer_addr, peer_addrlen, 
-                                  (struct sockaddr*)&peer_addr, peer_addrlen, 
-                                  xqc_now(), 
-                                  &temp_user_conn);
+        /* Use a stack-allocated structure to avoid memory leaks. The
+         * engine may use this user_data for writing back packets before
+         * the connection is fully established and conn_create_notify is
+         * called. Once established, the engine uses the user_data set
+         * via xqc_conn_set_transport_user_data. */
+        user_conn_t temp_user_conn;
+        memset(&temp_user_conn, 0, sizeof(user_conn_t));
+        temp_user_conn.server = this;
+        temp_user_conn.socket = listen_fd_;
+
+        if (!engine_) continue;
+
+        const struct sockaddr *peer = (const struct sockaddr *)&segs.peer;
+        socklen_t peer_len = segs.peer_len;
+        const struct sockaddr *local = segs.local_len ? (const struct sockaddr *)&segs.local
+                                                       : peer;
+        socklen_t local_len = segs.local_len ? segs.local_len : peer_len;
+
+        const unsigned char *seg;
+        size_t seg_len;
+        XQC_UDP_FOR_EACH_SEG(seg, seg_len, &segs) {
+            xqc_engine_packet_process(engine_,
+                                      seg, seg_len,
+                                      (struct sockaddr *)local, local_len,
+                                      (struct sockaddr *)peer,  peer_len,
+                                      xqc_now(),
+                                      &temp_user_conn);
+        }
     }
+
+    /* Notify the engine that the recv burst is done so it can run its
+     * ack/send pipeline, then flush whatever the engine queued. */
+    if (engine_) xqc_engine_finish_recv(engine_);
+    xqc_udp_writer_flush(&writer_);
 }

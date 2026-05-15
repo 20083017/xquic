@@ -7,6 +7,7 @@
 #include <xquic/xquic.h>
 #include <xquic/xqc_http3.h>
 #include "user_conn.h"
+#include "xqc_socket_opts.h"
 #include <string>
 #include <vector>
 

@@ -19,6 +19,12 @@ typedef enum {
     MOQ_AUDIO_FRAME
 } xqc_moq_frame_type_t;
 
+typedef enum {
+    XQC_MOQ_VIDEO_STREAM_CLASS_NONE = 0,
+    XQC_MOQ_VIDEO_STREAM_CLASS_KEY,
+    XQC_MOQ_VIDEO_STREAM_CLASS_DELTA,
+} xqc_moq_video_stream_class_t;
+
 
 typedef struct xqc_moq_stream_s {
     xqc_moq_session_t           *session;
@@ -53,6 +59,7 @@ typedef struct xqc_moq_stream_s {
     float                       fec_code_rate;
 
     uint16_t                    moq_frame_type;
+    uint8_t                     video_stream_class;
 } xqc_moq_stream_t;
 
 xqc_moq_stream_t *xqc_moq_stream_create(xqc_moq_session_t *session);

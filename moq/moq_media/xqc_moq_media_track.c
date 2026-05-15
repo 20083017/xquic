@@ -9,7 +9,16 @@
 #include "moq/moq_media/dejitter/xqc_moq_av_dejitter.h"
 #include "src/transport/xqc_stream.h"
 
-#define XQC_MOQ_MEDIA_MAX_SEND_DELAY 500000 /* 500ms */
+/*
+ * Per-frame-class send-delay budgets.
+ *
+ * Key (I) frames are gating: every following delta (P) frame in the same group
+ * is useless to the receiver until the key frame is delivered. So we apply a
+ * tighter budget to key streams and drop the whole group early instead of
+ * letting a slow I frame block all the P frames behind it.
+ */
+#define XQC_MOQ_MEDIA_MAX_SEND_DELAY     500000 /* 500ms - delta/audio fallback */
+#define XQC_MOQ_MEDIA_MAX_KEY_SEND_DELAY 200000 /* 200ms - key frame budget    */
 
 static void xqc_moq_media_on_create(xqc_moq_track_t *track);
 static void xqc_moq_media_on_destroy(xqc_moq_track_t *track);
@@ -36,6 +45,31 @@ const xqc_moq_track_ops_t xqc_moq_media_track_ops = {
 static void xqc_moq_media_cancel_write(xqc_moq_session_t *session, xqc_moq_track_t *track);
 static xqc_bool_t xqc_moq_media_maybe_cancel_write(xqc_moq_session_t *session, uint64_t subscribe_id,
     xqc_moq_track_t *track, xqc_moq_video_frame_t *video_frame);
+static xqc_moq_video_stream_class_t xqc_moq_video_stream_class(xqc_moq_video_frame_type_t frame_type);
+static xqc_stream_priority_t xqc_moq_video_stream_priority(xqc_moq_video_stream_class_t stream_class);
+static uint64_t xqc_moq_video_send_order(xqc_moq_video_stream_class_t stream_class);
+
+static xqc_moq_video_stream_class_t
+xqc_moq_video_stream_class(xqc_moq_video_frame_type_t frame_type)
+{
+    return frame_type == XQC_MOQ_VIDEO_KEY
+           ? XQC_MOQ_VIDEO_STREAM_CLASS_KEY
+           : XQC_MOQ_VIDEO_STREAM_CLASS_DELTA;
+}
+
+static xqc_stream_priority_t
+xqc_moq_video_stream_priority(xqc_moq_video_stream_class_t stream_class)
+{
+    return stream_class == XQC_MOQ_VIDEO_STREAM_CLASS_KEY
+           ? XQC_STREAM_PRI_HIGH
+           : XQC_STREAM_PRI_NORMAL;
+}
+
+static uint64_t
+xqc_moq_video_send_order(xqc_moq_video_stream_class_t stream_class)
+{
+    return stream_class == XQC_MOQ_VIDEO_STREAM_CLASS_KEY ? 0 : 1;
+}
 
 xqc_int_t
 xqc_moq_write_video_frame(xqc_moq_session_t *session, uint64_t subscribe_id,
@@ -44,8 +78,10 @@ xqc_moq_write_video_frame(xqc_moq_session_t *session, uint64_t subscribe_id,
     xqc_int_t ret = 0;
     xqc_int_t encoded_len;
     xqc_moq_stream_t *stream;
+    xqc_stream_t *quic_stream;
     xqc_moq_object_stream_msg_t object;
     xqc_moq_media_track_t *media_track = (xqc_moq_media_track_t*)track;
+    xqc_moq_video_stream_class_t stream_class = xqc_moq_video_stream_class(video_frame->type);
     
     if (xqc_moq_media_maybe_cancel_write(session, subscribe_id, track, video_frame)) {
         xqc_log(session->log, XQC_LOG_INFO, "|drop video frame|track_name:%s|subscribe_id:%ui|seq:%ui|type:%d|",
@@ -71,10 +107,19 @@ xqc_moq_write_video_frame(xqc_moq_session_t *session, uint64_t subscribe_id,
     stream->enable_fec = session->enable_fec;
     stream->fec_code_rate = session->fec_code_rate;
     stream->moq_frame_type |= (1 << MOQ_VIDEO_FRAME);
+    stream->video_stream_class = stream_class;
+
+    quic_stream = stream->trans_ops.quic_stream(stream->trans_stream);
+    if (quic_stream == NULL) {
+        xqc_log(session->log, XQC_LOG_ERROR, "|quic stream is NULL|");
+        ret = -XQC_ENULLPTR;
+        goto error;
+    }
+    xqc_stream_set_priority(quic_stream, xqc_moq_video_stream_priority(stream_class));
 
     object.subscribe_id = subscribe_id;
     object.track_alias = track->track_alias;
-    object.send_order = 0; //TODO
+    object.send_order = xqc_moq_video_send_order(stream_class);
     object.status = XQC_MOQ_OBJ_STATUS_NORMAL;
     object.payload = buf;
     object.payload_len = encoded_len;
@@ -99,16 +144,14 @@ xqc_moq_write_video_frame(xqc_moq_session_t *session, uint64_t subscribe_id,
     xqc_usec_t now = xqc_monotonic_timestamp();
     xqc_moq_fps_counter_insert(&media_track->fps_counter, now);
     xqc_int_t write_fps = xqc_moq_fps_counter_get(&media_track->fps_counter, now, 1000000);
-
-    xqc_stream_t *quic_stream = stream->trans_ops.quic_stream(stream->trans_stream);
     
     xqc_free(buf);
     xqc_log(session->log, XQC_LOG_INFO,
             "|write video frame success|track_name:%s|subscribe_id:%ui|seq:%ui|"
-            "group_id:%ui|object_id:%ui|stream_id:%ui|video_len:%ui|type:%d|fps:%d|",
+            "group_id:%ui|object_id:%ui|stream_id:%ui|video_len:%ui|type:%d|class:%d|send_order:%ui|fps:%d|",
             track->track_info.track_name, subscribe_id, video_frame->seq_num, 
             object.group_id, object.object_id, quic_stream->stream_id, video_frame->video_len, 
-            video_frame->type, write_fps);
+            video_frame->type, stream_class, object.send_order, write_fps);
     return XQC_OK;
 
 error:
@@ -220,34 +263,72 @@ xqc_moq_media_maybe_cancel_write(xqc_moq_session_t *session, uint64_t subscribe_
     xqc_usec_t create_time;
     xqc_usec_t now = xqc_monotonic_timestamp();
     xqc_int_t need_request_keyframe = 0;
+    xqc_int_t key_stall = 0;
     xqc_moq_media_track_t *media_track = (xqc_moq_media_track_t*)track;
-    
+
+    /*
+     * write_stream_list is appended in chronological order, so the head is
+     * the oldest pending stream. We scan oldest-first and stop as soon as we
+     * reach a stream younger than the smallest budget (the key budget): every
+     * subsequent stream is even younger and cannot trigger either threshold.
+     *
+     * Key (I) and delta (P) streams use different budgets so that a slow I
+     * frame is detected early and the whole group is reorganized (dropped +
+     * keyframe re-request) before more P frames pile up behind it.
+     */
     xqc_list_for_each_safe(pos, next, &media_track->write_stream_list) {
         stream = xqc_list_entry(pos, xqc_moq_stream_t, list_member);
         quic_stream = stream->trans_ops.quic_stream(stream->trans_stream);
         create_time = quic_stream->stream_stats.create_time;
-        if (now - create_time < XQC_MOQ_MEDIA_MAX_SEND_DELAY) {
+        xqc_usec_t age = now - create_time;
+
+        if (age < XQC_MOQ_MEDIA_MAX_KEY_SEND_DELAY) {
             break;
         }
+
+        xqc_usec_t threshold =
+            (stream->video_stream_class == XQC_MOQ_VIDEO_STREAM_CLASS_KEY)
+            ? XQC_MOQ_MEDIA_MAX_KEY_SEND_DELAY
+            : XQC_MOQ_MEDIA_MAX_SEND_DELAY;
+        if (age < threshold) {
+            continue;
+        }
+
         if (quic_stream->stream_state_send < XQC_SEND_STREAM_ST_DATA_RECVD) {
-            xqc_log(session->log, XQC_LOG_INFO, "|video frame timeout|seq:%ui|group_id:%ui|object_id:%ui|",
-                    video_frame->seq_num, stream->group_id, stream->object_id);
-            
-            media_track->drop_group_id_before = xqc_max(stream->group_id + 1, media_track->drop_group_id_before);
+            xqc_log(session->log, XQC_LOG_INFO,
+                    "|video frame timeout|seq:%ui|group_id:%ui|object_id:%ui|class:%d|age_us:%ui|",
+                    video_frame->seq_num, stream->group_id, stream->object_id,
+                    stream->video_stream_class, age);
+
+            /*
+             * For a stalled key stream, abandon its entire group (including
+             * itself) so receivers don't keep waiting on a key that isn't
+             * going to land in time. For a stalled delta, only drop up to
+             * (group_id + 1); the key of that group has already been sent,
+             * so the next group is the recovery point.
+             */
+            uint64_t drop_before = stream->group_id + 1;
+            media_track->drop_group_id_before =
+                xqc_max(drop_before, media_track->drop_group_id_before);
             media_track->drop_object_id_before = 0;
             need_request_keyframe = 1;
+            if (stream->video_stream_class == XQC_MOQ_VIDEO_STREAM_CLASS_KEY) {
+                key_stall = 1;
+            }
         }
     }
-    
+
     if (need_request_keyframe) {
         xqc_moq_media_cancel_write(session, track);
     }
-    
+
     if (video_frame->type == XQC_MOQ_VIDEO_KEY) {
         return XQC_FALSE;
     } else {
         if (need_request_keyframe) {
-            xqc_log(session->log, XQC_LOG_INFO, "|on_request_keyframe|track_name:%s|", track->track_info.track_name);
+            xqc_log(session->log, XQC_LOG_INFO,
+                    "|on_request_keyframe|track_name:%s|key_stall:%d|",
+                    track->track_info.track_name, key_stall);
             session->session_callbacks.on_request_keyframe(session->user_session, subscribe_id, track);
         }
         if (track->cur_group_id < media_track->drop_group_id_before) {

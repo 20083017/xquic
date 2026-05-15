@@ -1,6 +1,7 @@
 // xquic_client.cpp
 #include "xquic_client.h"
 #include "user_conn.h"
+#include "xqc_socket_opts.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -290,6 +291,10 @@ XquicClient::~XquicClient() {
         if (u_conn->ev_socket) event_free(u_conn->ev_socket);
         if (u_conn->fd >= 0) close(u_conn->fd);
         if (u_conn->peer_addr) free(u_conn->peer_addr);
+        if (u_conn->udp_writer) {
+            free(u_conn->udp_writer);
+            u_conn->udp_writer = NULL;
+        }
         free(u_conn);
     }
     conns_.clear();
@@ -481,6 +486,23 @@ user_conn_t* XquicClient::create_one_connection() {
         free(u_conn);
         return NULL;
     }
+
+    /* UDP performance / correctness tuning (POSIX stack).
+     * Client doesn't need IP_PKTINFO (connection has explicit peer addr). */
+    xqc_apply_udp_perf_opts(u_conn->fd, AF_INET, /*server=*/0);
+    xqc_enable_udp_gro(u_conn->fd);
+
+    /* Per-connection send-side coalescer (UDP_SEGMENT). */
+    xqc_udp_writer_t *w = (xqc_udp_writer_t *)calloc(1, sizeof(*w));
+    if (!w) {
+        close(u_conn->fd);
+        free(u_conn->peer_addr);
+        free(u_conn);
+        return NULL;
+    }
+    xqc_udp_writer_init(w, u_conn->fd);
+    u_conn->udp_writer = w;
+
     fcntl(u_conn->fd, F_SETFL, O_NONBLOCK);
     
     // Each connection's socket event passes u_conn as arg
@@ -930,12 +952,21 @@ void XquicClient::set_event_timer(xqc_msec_t wake_after) {
 
 ssize_t XquicClient::write_socket(const unsigned char *buf, size_t size, const struct sockaddr *peer_addr, socklen_t peer_addrlen, user_conn_t *user_conn) {
     if (!user_conn || user_conn->fd < 0) return -1;
+    xqc_udp_writer_t *w = (xqc_udp_writer_t *)user_conn->udp_writer;
+    if (w) return xqc_udp_writer_enqueue(w, buf, size, peer_addr, peer_addrlen);
+    /* Fallback: per-packet sendmsg via plain sendto when no writer. */
     return sendto(user_conn->fd, buf, size, 0, peer_addr, peer_addrlen);
 }
 
 void XquicClient::on_engine_timer() {
     if (engine_) {
         xqc_engine_main_logic(engine_);
+    }
+    /* Drain any packets queued by engine activity across all conns. */
+    for (auto *u_conn : conns_) {
+        if (u_conn && u_conn->udp_writer) {
+            xqc_udp_writer_flush((xqc_udp_writer_t *)u_conn->udp_writer);
+        }
     }
 }
 
@@ -950,18 +981,33 @@ void XquicClient::process_socket_read(user_conn_t *u_conn) {
         return;
     }
 
-    unsigned char buf[65536];
-    struct sockaddr_storage peer_addr;
-    socklen_t peer_addrlen;
-    
-    // 循环读取所有缓冲的数据包
-    while (1) {
-        peer_addrlen = sizeof(peer_addr);
-        ssize_t n = recvfrom(u_conn->fd, buf, sizeof(buf), 0, (struct sockaddr*)&peer_addr, &peer_addrlen);
+    unsigned char buf[64 * 1024];
+    xqc_udp_recv_segments_t segs;
+
+    /* Drain the socket so a single epoll wakeup amortizes over many
+     * datagrams (especially under UDP_GRO). */
+    for (;;) {
+        ssize_t n = xqc_udp_recvmsg_gro(u_conn->fd, buf, sizeof(buf), &segs);
         if (n <= 0) break;
-        xqc_engine_packet_process(engine_, buf, n, u_conn->peer_addr, u_conn->peer_addrlen, (struct sockaddr*)&peer_addr, peer_addrlen, xqc_now(), u_conn);
+
+        const struct sockaddr *peer = (const struct sockaddr *)&segs.peer;
+        socklen_t peer_len = segs.peer_len;
+
+        const unsigned char *seg;
+        size_t seg_len;
+        XQC_UDP_FOR_EACH_SEG(seg, seg_len, &segs) {
+            xqc_engine_packet_process(engine_, seg, seg_len,
+                                      u_conn->peer_addr, u_conn->peer_addrlen,
+                                      (struct sockaddr *)peer, peer_len,
+                                      xqc_now(), u_conn);
+        }
     }
-    
-    // 必须调用 finish_recv 通知引擎处理收到的包
+
+    /* 必须调用 finish_recv 通知引擎处理收到的包 */
     xqc_engine_finish_recv(engine_);
+
+    /* Flush any responses generated during this burst. */
+    if (u_conn->udp_writer) {
+        xqc_udp_writer_flush((xqc_udp_writer_t *)u_conn->udp_writer);
+    }
 }

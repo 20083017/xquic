@@ -7,6 +7,7 @@
 #include <xquic/xquic.h>
 #include <xquic/xqc_http3.h>
 #include "user_conn.h"
+#include "xqc_socket_opts.h"
 #include <string>
 
 class XquicServer {
@@ -53,6 +54,10 @@ private:
     event *ev_engine_;
     int listen_fd_;
     event *ev_listen_;
+
+    /* Send-side coalescer for UDP_SEGMENT (GSO). Drained after each
+     * recv burst and after engine timer ticks. */
+    xqc_udp_writer_t writer_;
     
     // Configuration
     int port_;

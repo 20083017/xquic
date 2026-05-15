@@ -11,11 +11,20 @@
 #include <cerrno>
 #include <cstring>
 #include <memory>
+#include <stdexcept>
+
+#if defined(_WIN32) || defined(_WIN64)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#else
 #include <netinet/in.h>
 #include <netinet/udp.h>
-#include <stdexcept>
 #include <sys/socket.h>
 #include <sys/uio.h>
+#endif
 
 /* UDP_SEGMENT (kernel ≥4.18) — define if libc headers don't provide it. */
 #ifndef UDP_SEGMENT
@@ -75,6 +84,7 @@ public:
         });
     }
 
+#if !defined(_WIN32) && !defined(_WIN64)
     /*
      * eBPF path: send via pollable_fd::sendmsg, optionally batching consecutive
      * same-peer same-size datagrams into a single UDP_SEGMENT (GSO) syscall.
@@ -155,6 +165,7 @@ public:
                 });
         });
     }
+#endif /* !Windows */
 
 private:
     static seastar::socket_address sockaddr_to_socket_address(const struct sockaddr *addr, socklen_t len) {

@@ -33,6 +33,8 @@
 #include <sys/socket.h>
 #include <sys/syscall.h>
 #include <unistd.h>
+
+#include "xqc_socket_opts.h"
 #include <fcntl.h>
 
 /**
@@ -103,10 +105,10 @@ public:
             throw std::runtime_error(std::string("SO_REUSEPORT failed: ") + strerror(errno));
         }
 
-        /* Increase buffer sizes */
-        int bufsize = 2 * 1024 * 1024;
-        setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &bufsize, sizeof(bufsize));
-        setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &bufsize, sizeof(bufsize));
+        /* Apply the shared UDP perf set: large buffers, DF=1 + IP_RECVERR
+         * for QUIC PMTUD, IP_PKTINFO for wildcard binds. See
+         * tests/xqc_socket_opts.h for the full rationale. */
+        xqc_apply_udp_perf_opts(fd, AF_INET, /*server=*/1);
 
         struct sockaddr_in addr;
         std::memset(&addr, 0, sizeof(addr));

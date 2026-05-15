@@ -8,6 +8,7 @@ extern "C" {
 #endif
 
 #include <stdint.h>
+#include <stddef.h>
 #include <sys/socket.h>
 #include <stdio.h>
 #include <xquic/xquic_typedef.h>
@@ -37,6 +38,7 @@ typedef struct user_stream_s {
     size_t send_body_len;
     size_t send_offset;
     size_t send_body_max;
+    int send_fin_pending;
     
     // Receiving Data (Client mostly)
     char* recv_body;        // Buffer for received body (for echo check)
@@ -75,6 +77,13 @@ typedef struct user_conn_s {
     // H3 specific
     void* h3_conn;          // xqc_h3_conn_t*
     int h3;                 // Flag indicating if this connection is using H3
+
+    /* Optional UDP send-side coalescer (xqc_udp_writer_t*). Allocated
+     * by the owning client when the fd is created; freed alongside the
+     * connection. Kept as void* to avoid pulling xqc_socket_opts.h
+     * (which uses C99 features like compound literals via cmsg) into
+     * every user_conn consumer. */
+    void* udp_writer;
 } user_conn_t;
 
 #ifdef __cplusplus
