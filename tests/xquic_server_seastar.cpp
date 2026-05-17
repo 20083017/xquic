@@ -4,6 +4,9 @@
 #include "user_conn.h"
 #include <xquic/xqc_video_frame.h>
 
+#include "lowlatency/xqc_h264_ff_decode_api.hh"
+#include "lowlatency/xqc_video_codec.hh"
+
 #ifdef XQC_SYS_WINDOWS
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -45,6 +48,7 @@
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <vector>
 
 namespace bpo = boost::program_options;
 
@@ -492,7 +496,7 @@ bool build_framed_response(xqc_stream_t *stream, user_stream_t *user_stream) {
  *
  * recv_body_fp is opened lazily on first frame.
  */
-bool process_video_frames(user_stream_t *user_stream, const std::string &output_dir) {
+bool process_video_frames(user_stream_t *user_stream, const std::string &output_dir, bool decode_off_reactor) {
     if (!user_stream || !user_stream->recv_body || user_stream->recv_body_len == 0) {
         return true; /* nothing to process */
     }
@@ -536,6 +540,14 @@ bool process_video_frames(user_stream_t *user_stream, const std::string &output_
         fwrite(data + offset + XQC_VIDEO_FRAME_HEADER_LEN, 1, hdr.payload_len,
                user_stream->recv_body_fp);
 
+        if (decode_off_reactor) {
+            std::vector<unsigned char> annexb(sizeof(start_code) + hdr.payload_len);
+            std::memcpy(annexb.data(), start_code, sizeof(start_code));
+            std::memcpy(annexb.data() + sizeof(start_code),
+                data + offset + XQC_VIDEO_FRAME_HEADER_LEN, hdr.payload_len);
+            xqc_h264_decode_push_annexb(hdr.camera_id, annexb.data(), annexb.size());
+        }
+
         offset += XQC_VIDEO_FRAME_HEADER_LEN + hdr.payload_len;
 
         if (hdr.flags & XQC_VIDEO_FLAG_EOS) {
@@ -568,6 +580,7 @@ XquicSeastarServer::XquicSeastarServer()
     , _send_flush_in_progress(false)
     , _echo_mode(false)
     , _video_mode(false)
+    , _video_decode_off_reactor(false)
     , _native_stack(false) {
     _packet_user_conn.server = this;
 }
@@ -643,10 +656,18 @@ void XquicSeastarServer::init_xquic_engine() {
 }
 
 seastar::future<> XquicSeastarServer::start_service(uint16_t port, const std::string& cert_path, const std::string& key_path,
-                                            bool echo_mode, bool video_mode, const std::string& video_output_dir) {
+                                            bool echo_mode, bool video_mode, const std::string& video_output_dir,
+                                            bool video_decode_off_reactor) {
     _echo_mode = echo_mode;
     _video_mode = video_mode;
+    _video_decode_off_reactor = video_decode_off_reactor;
     _video_output_dir = video_output_dir;
+    if (_video_mode && _video_decode_off_reactor) {
+        const char* codec_env = getenv("XQC_VIDEO_CODEC");
+        xqc_h264_decode_set_default_codec(
+            xqc_video_codec_parse(codec_env, XqcVideoCodec::HEVC));
+        xqc_h264_decode_worker_start();
+    }
     try {
         _port = port;
         _cert_path = cert_path;
@@ -1220,13 +1241,13 @@ xqc_int_t XquicSeastarServer::on_stream_read_notify(xqc_stream_t *stream, void *
             user_stream->total_recvd += static_cast<size_t>(read);
             _stats.video_bytes_recvd += static_cast<size_t>(read);
 
-            if (!process_video_frames(user_stream, _video_output_dir)) {
+            if (!process_video_frames(user_stream, _video_output_dir, _video_decode_off_reactor)) {
                 return -1;
             }
 
             if (fin) {
                 /* Flush any remaining buffered data */
-                process_video_frames(user_stream, _video_output_dir);
+                process_video_frames(user_stream, _video_output_dir, _video_decode_off_reactor);
                 user_stream->recv_fin = 1;
                 _stats.video_streams_finished++;
                 std::cout << "[video] Stream finished, total_recvd="
@@ -1681,7 +1702,9 @@ int main(int argc, char **argv) {
         ("key", bpo::value<std::string>()->default_value("./server.key"), "TLS private key path")
         ("echo,e", bpo::bool_switch()->default_value(false), "Enable streaming echo mode (default: framed protocol)")
         ("video,v", bpo::bool_switch()->default_value(false), "Enable video stream receiver mode")
-        ("video-dir", bpo::value<std::string>()->default_value("./video_out"), "Output directory for recorded .h264 files");
+        ("video-dir", bpo::value<std::string>()->default_value("./video_out"), "Output directory for recorded .h264 files")
+        ("video-decode", bpo::bool_switch()->default_value(false),
+            "Feed received H.264 to FFmpeg decode thread (bounded queue; off reactor)");
 
     return app.run_deprecated(argc, argv, [&app] {
         auto& config = app.configuration();
@@ -1691,14 +1714,15 @@ int main(int argc, char **argv) {
         auto echo = config["echo"].as<bool>();
         auto video = config["video"].as<bool>();
         auto vdir = config["video-dir"].as<std::string>();
+        auto vdecode = config["video-decode"].as<bool>();
 
         static seastar::sharded<XquicSeastarServer> server;
 
-        return server.start().then([port, cert, key, echo, video, vdir] {
+        return server.start().then([port, cert, key, echo, video, vdir, vdecode] {
             /* Start the QUIC engine on every shard */
-            return server.invoke_on_all([port, cert, key, echo, video, vdir](XquicSeastarServer &s) {
+            return server.invoke_on_all([port, cert, key, echo, video, vdir, vdecode](XquicSeastarServer &s) {
                 s.set_distributed(&server);
-                return s.start_service(port, cert, key, echo, video, vdir);
+                return s.start_service(port, cert, key, echo, video, vdir, vdecode);
             });
         }).then([] {
             std::cout << "Seastar XQUIC server ready (" << seastar::smp::count << " shards)" << std::endl;
@@ -1706,7 +1730,10 @@ int main(int argc, char **argv) {
                 return seastar::sleep(std::chrono::hours(24));
             });
         }).finally([] {
-            return server.stop();
+            return server.stop().finally([] {
+                xqc_h264_decode_worker_stop();
+                return seastar::make_ready_future<>();
+            });
         });
     });
 }

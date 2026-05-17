@@ -37,7 +37,8 @@ public:
 
     /* Called by seastar::distributed<>::start() on each shard */
     seastar::future<> start_service(uint16_t port, const std::string& cert_path, const std::string& key_path,
-                                    bool echo_mode, bool video_mode, const std::string& video_output_dir);
+                                    bool echo_mode, bool video_mode, const std::string& video_output_dir,
+                                    bool video_decode_off_reactor);
     seastar::future<> stop();
 
     /* Set the distributed<> back-pointer (called once on each shard after start) */
@@ -64,6 +65,7 @@ private:
     bool _send_flush_in_progress;
     bool _echo_mode;
     bool _video_mode;
+    bool _video_decode_off_reactor;
     std::string _video_output_dir;
     bool _native_stack;   /* true when using Seastar native/DPDK net stack */
     seastar::distributed<XquicSeastarServer> *_distributed = nullptr;

@@ -13,6 +13,12 @@ The implementation includes:
 
 ## Architecture Components
 
+### MOQ Video Stream Classes
+- MOQ video objects still use one QUIC unidirectional stream per object, because `OBJECT_STREAM` payload completion is tied to stream `FIN`.
+- Key frames and delta frames are now separated into different stream classes rather than long-lived shared streams.
+- Key-frame streams are marked high priority at the QUIC stream layer so recovery points are scheduled ahead of dependent delta frames.
+- Delta frames remain on normal-priority streams, which keeps the design compatible with the current receiver-side object-stream decoder.
+
 ### 1. Frame Handling System
 - `FrameInfo` structure with PTS, DTS, frame type, dependencies, and data
 - Dual indexing: `std::map<PTS, FrameInfo*>` for sorting and `std::unordered_map<FrameID, FrameInfo*>` for lookup

@@ -2,7 +2,8 @@
 
 **设计规格**：[`VIDEO_LOW_LATENCY_WINDOWS_DESIGN.md`](./VIDEO_LOW_LATENCY_WINDOWS_DESIGN.md)（HEVC + NVDEC + OpenGL PBO、Optimus、2/3 PBO 策略等）。
 
-**本文作用**：把规格拆成 **可验收的阶段**，并标明与 **当前仓库实现** 的差距，避免「以为只要按文档顺序写代码即可」而忽略构建与平台前置条件。
+**仓库实现索引（W1–W5 样例代码）**：[`tests/lowlatency/README.md`](../tests/lowlatency/README.md)  
+**构建**：`-DXQC_ENABLE_TESTING=ON -DXQC_ENABLE_LOWLATENCY_PHASES=ON`（Windows）。
 
 ---
 
@@ -23,8 +24,8 @@
 |--------------|----------|
 | xquic + Seastar 收发包 | 已有 **`tests/xquic_server_seastar.cpp`**；**CMake + 头文件/源文件已对 Windows 做首步适配**（见下）；**`xquic_server_seastar_ebpf` 不在 Windows 上构建**。 |
 | HEVC 码流、video 客户端 | 已有 **`video_client` / `video_bench`**（libevent，跨平台 CMake 较完整）。 |
-| NVDEC、OpenGL、PBO、Optimus 自检 | **无**；需 **新可执行程序** 或独立模块（建议 **不要** 塞进 Seastar reactor 线程）。 |
-| 2/3 PBO 策略模式 | **无**；在渲染模块内新增。 |
+| NVDEC、OpenGL、PBO、Optimus 自检 | **部分落地**：**W1** `xqc_gpu_windows_selftest`；**W2 基线** `xqc_nv12_gl_pbo_viewer`（**raw NV12 文件**，FFmpeg NVDEC 待接）。见 **`tests/lowlatency/`**。 |
+| 2/3 PBO 策略模式 | **样例**：`xqc_nv12_gl_pbo_viewer --triple-pbo` 仅多分配 PBO；**动态策略类**仍待实现。 |
 
 ---
 
@@ -46,6 +47,8 @@
 
 **目标**：任何会创建 GL / 调 NVDEC 的进程 **启动即验证** NVIDIA 路径（`NvOptimusEnablement` + 系统高性能 + `GL_VENDOR`/`GL_RENDERER`）。
 
+**实现**：`tests/lowlatency/xqc_gpu_windows_selftest.cpp` → 目标 **`xqc_gpu_windows_selftest`**（`XQC_ENABLE_LOWLATENCY_PHASES`）。
+
 **验收**：故意在核显优先环境下应 **日志告警或退出**（与设计一致）。
 
 ---
@@ -55,6 +58,8 @@
 **目标**：独立 **`player`/`viewer`**（或 `video_client` 的显示分支）：  
 FFmpeg **HEVC + NVDEC** → **NV12**（必要时 hwdownload）→ **2 PBO**（再扩展 **3 PBO + 策略模式**，见设计 §5）→ **全屏 + V-Sync + shader（BT.709/2020）**。
 
+**实现（当前）**：`tests/lowlatency/xqc_nv12_gl_pbo_viewer.cpp` — **raw NV12** 一帧 → **双/三 PBO** + **GL 3.3** + **BT.709 limited** fragment；**`wglSwapIntervalEXT(1)`**；**`NvOptimusEnablement` 导出**；**§5.7** 粗测：`xqc_lowlatency_perf.hh` 打 **swap-to-swap** 周期日志。**FFmpeg NVDEC 解码**下一步替换文件输入即可。
+
 **验收**：本地文件或 **UDP 裸流** 先跑通，再接到 xquic 流；**§5.7** 指标可手工采一版（抖动 / 端到端 / CPU）。
 
 ---
@@ -62,6 +67,8 @@ FFmpeg **HEVC + NVDEC** → **NV12**（必要时 hwdownload）→ **2 PBO**（�
 ### Phase W3 — 与设计 §1 + §8 对齐：有界队列 + 与 xquic 边界
 
 **目标**：**解码 / GL 不进 Seastar reactor**；reactor 或 libevent 回调仅 **投递 HEVC AU/包** 至 **SPSC 解码队列**；解码线程 **ref/unref `AVFrame`** 再入 **渲染队列**（设计 §1–§2）。
+
+**实现**：`tests/lowlatency/xqc_bounded_frame_queue.hh` — **mutex + condition_variable** 有界队列，`push_drop_oldest`、`try_pop_latest`；可直接承载 **`AVFrame*`** 或 **`std::vector<uint8_t>`**（模板 `T`）。与 xquic 的 reactor 边界需在业务线程中 **接入**（本提交未改 `xquic_server_seastar.cpp` 主路径）。
 
 **验收**：长时间跑 **无泄漏**（AddressSanitizer 或 Windows 等价工具能上的话）、**无死锁**；队列满策略符合设计（丢最旧等）。
 
@@ -71,6 +78,8 @@ FFmpeg **HEVC + NVDEC** → **NV12**（必要时 hwdownload）→ **2 PBO**（�
 
 **目标**：发送侧（可为 **FFmpeg 命令行** 或 **独立 encoder 模块**）固化 **`ffmpeg -h encoder=hevc_nvenc`** 核对后的 **4K 低延迟参数 JSON**；与接收侧 **NVDEC** 对称测试。
 
+**实现**：`docs/config/hevc_nvenc_low_latency.json` — CLI 参数模板 + Pascal 说明；**仍需**按本机 `ffmpeg -h encoder=hevc_nvenc` 逐项核对键名。
+
 **验收**：同机或双机 **RTT/丢包** 场景下记录 **E2E** 与 **卡顿主观/客观指标**；明确 **无 `av1_nvenc`** 于 1050 Ti。
 
 ---
@@ -78,6 +87,8 @@ FFmpeg **HEVC + NVDEC** → **NV12**（必要时 hwdownload）→ **2 PBO**（�
 ### Phase W5 — 与设计 §4 对齐：8750H 绑核与散热遥测（可选但建议）
 
 **目标**：Seastar **`--cpuset`**、解码线程 affinity、简单 **频率/温度/帧时间** 日志（与设计 §4–§5.7 一致）。
+
+**实现**：`tests/lowlatency/xqc_lowlatency_perf.hh`（**QPC** 帧间隔）；**Seastar `--cpuset`** 仍为运行时参数（见 Seastar 文档）；CPU/GPU 温度频率需 **WMI/NVML** 等后续再接。
 
 **验收**：对比 **乱绑 vs 文档化绑核** 的 **p95 帧间隔** 与 **CPU 触顶** 情况。
 

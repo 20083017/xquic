@@ -23,7 +23,11 @@
 #include <event2/event.h>
 #include <time.h>
 #include <iostream>
+#include <cstring>
+#include <vector>
 #include <getopt.h>
+
+#include "lowlatency/xqc_h264_ff_decode_api.hh"
 
 /* ─── Helpers ──────────────────────────────────────────────────── */
 
@@ -51,6 +55,10 @@ static void vc_socket_cb(int fd, short what, void *arg) {
 
 static void vc_set_event_timer(xqc_msec_t wake_after, void *ud) {
     if (ud) static_cast<XqcVideoClient*>(ud)->set_event_timer(wake_after);
+}
+
+static void vc_pace_timer_cb(int, short, void *arg) {
+    if (arg) static_cast<XqcVideoClient*>(arg)->on_pace_tick();
 }
 
 static ssize_t vc_write_socket(const unsigned char *buf, size_t size,
@@ -132,8 +140,88 @@ static const uint8_t* find_start_code(const uint8_t *data, size_t len, int *sc_l
     return NULL;
 }
 
+static bool nal_advances_pts(uint8_t nal_type, XqcVideoCodec codec) {
+    if (codec == XqcVideoCodec::HEVC) {
+        return nal_type != XQC_HEVC_NAL_VPS && nal_type != XQC_HEVC_NAL_SPS
+            && nal_type != XQC_HEVC_NAL_PPS && nal_type != XQC_HEVC_NAL_AUD;
+    }
+    return nal_type != XQC_H264_NAL_SPS && nal_type != XQC_H264_NAL_PPS && nal_type != XQC_H264_NAL_SEI;
+}
+
+static void classify_nal_byte(uint8_t b, XqcVideoCodec codec, nal_unit_t& nal) {
+    uint8_t nal_type = 0;
+    if (codec == XqcVideoCodec::HEVC) {
+        nal_type = xqc_video_hevc_nal_type(b);
+        nal.type = xqc_video_hevc_nal_to_frame_type(nal_type);
+        nal.flags = 0;
+        if (nal_type == XQC_HEVC_NAL_IDR_W_RADL || nal_type == XQC_HEVC_NAL_IDR_N_LP
+            || nal_type == XQC_HEVC_NAL_CRA_N_LP) {
+            nal.flags |= XQC_VIDEO_FLAG_KEYFRAME;
+        }
+        if (nal_type == XQC_HEVC_NAL_VPS || nal_type == XQC_HEVC_NAL_SPS || nal_type == XQC_HEVC_NAL_PPS) {
+            nal.flags |= XQC_VIDEO_FLAG_CONFIG;
+        }
+    } else {
+        nal_type = xqc_video_h264_nal_type(b);
+        nal.type = xqc_video_h264_nal_to_frame_type(nal_type);
+        nal.flags = 0;
+        if (nal_type == XQC_H264_NAL_IDR) {
+            nal.flags |= XQC_VIDEO_FLAG_KEYFRAME;
+        }
+        if (nal_type == XQC_H264_NAL_SPS || nal_type == XQC_H264_NAL_PPS) {
+            nal.flags |= XQC_VIDEO_FLAG_CONFIG;
+        }
+    }
+}
+
+void XqcVideoClient::reassign_pts(std::vector<nal_unit_t> &nals, int64_t pts_step_us, XqcVideoCodec codec) {
+    int64_t pts = 0;
+    const int64_t step = pts_step_us > 0 ? pts_step_us : 33333;
+    for (auto &nal : nals) {
+        nal.pts_us = pts;
+        const uint8_t nal_type = (codec == XqcVideoCodec::HEVC)
+            ? xqc_video_hevc_nal_type(nal.data[0])
+            : xqc_video_h264_nal_type(nal.data[0]);
+        if (nal_advances_pts(nal_type, codec)) {
+            pts += step;
+        }
+    }
+}
+
+int64_t XqcVideoClient::infer_pace_us(const std::vector<nal_unit_t> &nals, int target_fps, XqcVideoCodec codec) {
+    if (target_fps > 0) {
+        return 1000000 / target_fps;
+    }
+    size_t slices = 0;
+    int64_t max_pts = 0;
+    for (const auto &nal : nals) {
+        if (!nal.data || nal.len == 0) {
+            continue;
+        }
+        const uint8_t nal_type = (codec == XqcVideoCodec::HEVC)
+            ? xqc_video_hevc_nal_type(nal.data[0])
+            : xqc_video_h264_nal_type(nal.data[0]);
+        if (nal_advances_pts(nal_type, codec)) {
+            ++slices;
+        }
+        if (nal.pts_us > max_pts) {
+            max_pts = nal.pts_us;
+        }
+    }
+    if (slices > 1 && max_pts > 0) {
+        return max_pts / static_cast<int64_t>(slices - 1);
+    }
+    return 33333;
+}
+
 bool XqcVideoClient::load_h264_file(const std::string &path, uint16_t camera_id,
-                                     std::vector<nal_unit_t> &out_nals)
+    std::vector<nal_unit_t> &out_nals, int64_t pts_step_us)
+{
+    return load_annexb_file(path, camera_id, XqcVideoCodec::H264, out_nals, pts_step_us);
+}
+
+bool XqcVideoClient::load_annexb_file(const std::string &path, uint16_t camera_id,
+    XqcVideoCodec codec, std::vector<nal_unit_t> &out_nals, int64_t pts_step_us)
 {
     FILE *fp = fopen(path.c_str(), "rb");
     if (!fp) {
@@ -165,7 +253,7 @@ bool XqcVideoClient::load_h264_file(const std::string &path, uint16_t camera_id,
     }
 
     int64_t pts = 0;
-    const int64_t frame_duration_us = 33333; /* ~30 fps */
+    const int64_t frame_duration_us = pts_step_us > 0 ? pts_step_us : 33333;
 
     while (nal_start < end) {
         /* Find next start code to determine NAL end */
@@ -188,14 +276,12 @@ bool XqcVideoClient::load_h264_file(const std::string &path, uint16_t camera_id,
             nal.len = nal_len;
             nal.pts_us = pts;
 
-            uint8_t nal_type = xqc_video_h264_nal_type(nal.data[0]);
-            nal.type = xqc_video_h264_nal_to_frame_type(nal_type);
-            nal.flags = 0;
-            if (nal_type == XQC_H264_NAL_IDR) nal.flags |= XQC_VIDEO_FLAG_KEYFRAME;
-            if (nal_type == XQC_H264_NAL_SPS || nal_type == XQC_H264_NAL_PPS) nal.flags |= XQC_VIDEO_FLAG_CONFIG;
+            classify_nal_byte(nal.data[0], codec, nal);
 
-            /* Only increment PTS for slice NALs (not SPS/PPS/SEI) */
-            if (nal_type != XQC_H264_NAL_SPS && nal_type != XQC_H264_NAL_PPS && nal_type != XQC_H264_NAL_SEI) {
+            const uint8_t nal_type = (codec == XqcVideoCodec::HEVC)
+                ? xqc_video_hevc_nal_type(nal.data[0])
+                : xqc_video_h264_nal_type(nal.data[0]);
+            if (nal_advances_pts(nal_type, codec)) {
                 pts += frame_duration_us;
             }
 
@@ -207,7 +293,8 @@ bool XqcVideoClient::load_h264_file(const std::string &path, uint16_t camera_id,
     }
 
     free(buf);
-    printf("Loaded %s: %zu NAL units, camera_id=%u\n", path.c_str(), out_nals.size(), camera_id);
+    printf("Loaded %s: %zu NAL units, camera_id=%u codec=%s\n", path.c_str(), out_nals.size(),
+        camera_id, xqc_video_codec_name(codec));
     return true;
 }
 
@@ -221,7 +308,7 @@ void XqcVideoClient::free_nals(std::vector<nal_unit_t> &nals) {
 
 /* ─── Prepare send buffer for current NAL ─────────────────────── */
 
-static void prepare_send_buf(camera_stream_t *cam) {
+static void prepare_send_buf(camera_stream_t *cam, bool decode_preview) {
     if (cam->nal_index >= cam->nals.size()) return;
 
     const nal_unit_t &nal = cam->nals[cam->nal_index];
@@ -247,25 +334,40 @@ static void prepare_send_buf(camera_stream_t *cam) {
     xqc_video_frame_header_encode(cam->send_buf, &hdr);
     memcpy(cam->send_buf + XQC_VIDEO_FRAME_HEADER_LEN, nal.data, nal.len);
 
+    if (decode_preview && nal.len > 0) {
+        static const uint8_t kStart[] = {0x00, 0x00, 0x00, 0x01};
+        std::vector<uint8_t> annexb(sizeof(kStart) + nal.len);
+        std::memcpy(annexb.data(), kStart, sizeof(kStart));
+        std::memcpy(annexb.data() + sizeof(kStart), nal.data, nal.len);
+        xqc_h264_decode_push_annexb_ts(cam->camera_id, annexb.data(), annexb.size(),
+            hdr.pts_us, now_us());
+    }
+
     cam->send_buf_offset = 0;
 }
 
 /* ─── XqcVideoClient Implementation ──────────────────────────── */
 
 XqcVideoClient::XqcVideoClient()
-    : engine_(nullptr), event_base_(nullptr), ev_engine_(nullptr),
+    : engine_(nullptr), event_base_(nullptr), ev_engine_(nullptr), ev_pace_(nullptr),
       server_ip_("127.0.0.1"), port_(8443), device_id_("device-001"),
-      num_cameras_(0), u_conn_(nullptr)
+      num_cameras_(0), u_conn_(nullptr), decode_preview_(false),
+      paced_send_(true), target_fps_(0), pace_us_(33333),
+      default_codec_(XqcVideoCodec::HEVC)
 {
     memset(cameras_, 0, sizeof(cameras_));
 }
 
 XqcVideoClient::~XqcVideoClient() {
+    if (decode_preview_) {
+        xqc_h264_decode_worker_stop();
+    }
     for (int i = 0; i < 2; i++) {
         free(cameras_[i].send_buf);
         free_nals(cameras_[i].nals);
     }
     if (engine_) xqc_engine_destroy(engine_);
+    if (ev_pace_) event_free(ev_pace_);
     if (ev_engine_) event_free(ev_engine_);
     if (event_base_) event_base_free(event_base_);
 }
@@ -278,6 +380,10 @@ int XqcVideoClient::init(int argc, char *argv[]) {
         {"cam0",     required_argument, 0, '0'},
         {"cam1",     required_argument, 0, '1'},
         {"device",   required_argument, 0, 'd'},
+        {"decode-preview", no_argument, 0, 1001},
+        {"fps", required_argument, 0, 1002},
+        {"no-pace", no_argument, 0, 1003},
+        {"codec", required_argument, 0, 1004},
         {0, 0, 0, 0}
     };
 
@@ -289,33 +395,63 @@ int XqcVideoClient::init(int argc, char *argv[]) {
         case '0': cam_files_[0] = optarg; break;
         case '1': cam_files_[1] = optarg; break;
         case 'd': device_id_ = optarg; break;
+        case 1001: decode_preview_ = true; break;
+        case 1002: target_fps_ = atoi(optarg); break;
+        case 1003: paced_send_ = false; break;
+        case 1004:
+            default_codec_ = xqc_video_codec_parse(optarg, XqcVideoCodec::HEVC);
+            break;
         }
     }
 
     /* Count cameras */
     num_cameras_ = 0;
+    pace_us_ = 33333;
     for (int i = 0; i < 2; i++) {
         if (!cam_files_[i].empty()) {
-            if (!load_h264_file(cam_files_[i], i, cameras_[i].nals)) {
+            const XqcVideoCodec cam_codec = xqc_video_codec_from_path(
+                cam_files_[i].c_str(), default_codec_);
+            if (!load_annexb_file(cam_files_[i], i, cam_codec, cameras_[i].nals, 0)) {
                 fprintf(stderr, "Failed to load camera %d file: %s\n", i, cam_files_[i].c_str());
                 return -1;
             }
             cameras_[i].camera_id = i;
+            cameras_[i].codec = cam_codec;
+            const int64_t cam_pace = infer_pace_us(cameras_[i].nals, target_fps_, cam_codec);
+            cameras_[i].pace_us = cam_pace;
+            if (target_fps_ > 0) {
+                reassign_pts(cameras_[i].nals, cam_pace, cam_codec);
+            }
+            if (pace_us_ > cam_pace || num_cameras_ == 0) {
+                pace_us_ = cam_pace;
+            }
             num_cameras_++;
         }
     }
 
     if (num_cameras_ == 0) {
-        fprintf(stderr, "Usage: %s -a <ip> -p <port> --cam0 <file.h264> [--cam1 <file.h264>]\n", argv[0]);
+        fprintf(stderr,
+            "Usage: %s -a <ip> -p <port> --cam0 <file.h265|.h264> [--cam1 ...] [--codec hevc|h264]\n",
+            argv[0]);
         return -1;
     }
 
-    printf("Video client: %d camera(s), device=%s, server=%s:%d\n",
-           num_cameras_, device_id_.c_str(), server_ip_.c_str(), port_);
+    if (decode_preview_) {
+        for (int i = 0; i < num_cameras_; ++i) {
+            xqc_h264_decode_set_camera_codec(cameras_[i].camera_id, cameras_[i].codec);
+        }
+        xqc_h264_decode_worker_start();
+    }
+
+    printf("Video client: %d camera(s), device=%s, server=%s:%d pace_us=%lld fps_target=%d paced=%d%s\n",
+           num_cameras_, device_id_.c_str(), server_ip_.c_str(), port_,
+           static_cast<long long>(pace_us_), target_fps_, paced_send_ ? 1 : 0,
+           decode_preview_ ? ", decode-preview=on" : "");
 
     /* libevent */
     event_base_ = event_base_new();
     ev_engine_ = event_new(event_base_, -1, 0, vc_engine_timer_cb, this);
+    ev_pace_ = event_new(event_base_, -1, 0, vc_pace_timer_cb, this);
 
     /* xquic engine */
     xqc_engine_ssl_config_t ssl_cfg;
@@ -442,9 +578,75 @@ void XqcVideoClient::create_camera_streams(user_conn_t *u_conn) {
 
         printf("Created stream for camera %d, %zu NAL units\n", i, cameras_[i].nals.size());
 
-        /* Prepare first NAL and start sending */
-        prepare_send_buf(&cameras_[i]);
-        send_camera_data(&cameras_[i]);
+        prepare_send_buf(&cameras_[i], decode_preview_);
+        if (paced_send_) {
+            try_send_camera_once(&cameras_[i]);
+        } else {
+            send_camera_data(&cameras_[i]);
+        }
+    }
+    if (paced_send_) {
+        schedule_pace_timer();
+    }
+}
+
+void XqcVideoClient::schedule_pace_timer() {
+    if (!ev_pace_ || pace_us_ <= 0) {
+        return;
+    }
+    struct timeval tv;
+    tv.tv_sec = static_cast<long>(pace_us_ / 1000000);
+    tv.tv_usec = static_cast<long>(pace_us_ % 1000000);
+    event_add(ev_pace_, &tv);
+}
+
+void XqcVideoClient::on_pace_tick() {
+    for (int i = 0; i < 2; i++) {
+        if (!cameras_[i].nals.empty() && !cameras_[i].finished) {
+            try_send_camera_once(&cameras_[i]);
+        }
+    }
+    schedule_pace_timer();
+}
+
+void XqcVideoClient::try_send_camera_once(camera_stream_t *cam) {
+    if (!cam || !cam->stream || cam->finished) {
+        return;
+    }
+
+    if (cam->send_buf && cam->send_buf_offset >= cam->send_buf_len) {
+        cam->nal_index++;
+        if (cam->nal_index >= cam->nals.size()) {
+            cam->finished = 1;
+            printf("Camera %u: all %zu NALs sent, total=%zu bytes\n",
+                   cam->camera_id, cam->nals.size(),
+                   cam->u_stream ? cam->u_stream->total_sent : 0);
+            return;
+        }
+        prepare_send_buf(cam, decode_preview_);
+    }
+
+    if (!cam->send_buf) {
+        return;
+    }
+
+    const size_t remaining = cam->send_buf_len - cam->send_buf_offset;
+    const int fin = (cam->nal_index == cam->nals.size() - 1) ? 1 : 0;
+    const ssize_t sent = xqc_stream_send(cam->stream,
+        cam->send_buf + cam->send_buf_offset, remaining, fin);
+
+    if (sent == -XQC_EAGAIN) {
+        return;
+    }
+    if (sent < 0) {
+        fprintf(stderr, "Camera %u: send error=%zd\n", cam->camera_id, sent);
+        cam->finished = 1;
+        return;
+    }
+
+    cam->send_buf_offset += static_cast<size_t>(sent);
+    if (cam->u_stream) {
+        cam->u_stream->total_sent += static_cast<size_t>(sent);
     }
 }
 
@@ -463,7 +665,7 @@ void XqcVideoClient::send_camera_data(camera_stream_t *cam) {
                        cam->u_stream ? cam->u_stream->total_sent : 0);
                 return;
             }
-            prepare_send_buf(cam);
+            prepare_send_buf(cam, decode_preview_);
         }
 
         if (!cam->send_buf) return;
@@ -504,7 +706,14 @@ void XqcVideoClient::on_conn_close_notify(xqc_connection_t *conn, const xqc_cid_
 xqc_int_t XqcVideoClient::on_stream_write_notify(xqc_stream_t *stream, void *user_data) {
     (void)stream;
     auto *cam = static_cast<camera_stream_t*>(user_data);
-    if (cam) send_camera_data(cam);
+    if (!cam) {
+        return 0;
+    }
+    if (paced_send_) {
+        try_send_camera_once(cam);
+    } else {
+        send_camera_data(cam);
+    }
     return 0;
 }
 

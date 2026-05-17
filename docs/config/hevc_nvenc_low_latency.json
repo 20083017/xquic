@@ -1,0 +1,25 @@
+{
+  "_comment": "Phase W4 — template for 4K low-latency HEVC NVENC. Verify every key with: ffmpeg -h encoder=hevc_nvenc (FFmpeg build-dependent). Pascal (e.g. GTX 1050 Ti) has no av1_nvenc.",
+  "encoder": "hevc_nvenc",
+  "notes": "Tune for your GPU/driver; measure end-to-end latency on target hardware.",
+  "ffmpeg_cli_args_template": [
+    "-c:v", "hevc_nvenc",
+    "-preset", "p4",
+    "-tune", "ll",
+    "-rc", "cbr",
+    "-b:v", "35M",
+    "-maxrate", "40M",
+    "-bufsize", "80M",
+    "-g", "30",
+    "-bf", "0",
+    "-rc-lookahead", "0",
+    "-spatial-aq", "0",
+    "-temporal-aq", "0",
+    "-delay", "0",
+    "-extra_hw_frames", "0"
+  ],
+  "pascal_constraints": {
+    "av1_nvenc": false,
+    "recommend_hevc_nvenc_for_4k45": true
+  }
+}

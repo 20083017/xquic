@@ -61,6 +61,68 @@ xquic 需发包时 → 静态回调 ss_write_socket()
 - **`xquic_server_seastar_ebpf`**：`tests/xquic_server_seastar_ebpf.cpp`，在 **Linux POSIX 栈** 上配合 **SO_REUSEPORT + eBPF** 做内核侧分发，减轻 shard 0 瓶颈。
 - 与 DPDK **二选一或分场景**：eBPF 依赖内核与策略；DPDK 依赖绑卡、大页、权限。二者在仓库中均为**评估/增强路径**，不是默认单一路线。
 
+### 2.5 视频媒体字节流（在 Seastar + XQUIC 栈中的位置）
+
+视频业务仍走 **§2.1 同一收包路径**：`udp_channel` → `xqc_engine_packet_process` → **transport ALPN `transport`** 上的 **`on_stream_read_notify`**。与「纯 echo」不同之处在于：回调内对 **流字节** 做 **xquic 视频 wire（16B 头 + NAL）** 重组，再 **写盘** 和/或 **推入有界队列** 供 **独立解码线程** 消费（详见 **`VIDEO_LOW_LATENCY_WINDOWS_DESIGN.md` §0**）。
+
+```mermaid
+flowchart TB
+  UDP["UDP datagram"] --> SS["Seastar: on_datagram / process_packet_local"]
+  SS --> XQC["xqc_engine_packet_process"]
+  XQC --> CB["stream_read_notify\n(video 模式)"]
+  CB --> W["解析 xqc_video_frame\n→ Annex-B"]
+  W --> F["写 *.h264（可选）"]
+  W --> Q["XqcBoundedFrameQueue\n(reactor 外)"]
+  Q --> DEC["FFmpeg 解码线程\n(可选 CMake)"]
+```
+
+**结论**：**DPDK / eBPF / POSIX** 只改变 **UDP 如何进 `xqc_engine_packet_process`**；**视频语义**（wire、队列、解码）位于 **xQUIC 流回调之上**，与网络后端正交。
+
+### 2.6 GPU / CPU 分工（WSL `xqc_video_receiver` 现状，4K 目标）
+
+| 阶段 | 线程 | 硬件 | 实现位置 |
+|------|------|------|----------|
+| QUIC + wire 解析 | reactor（libevent） | CPU | `xqc_video_recv_process.hh` |
+| H.264 解码 | 解码线程 | **CPU**（FFmpeg software） | `xqc_h264_ff_decode_worker.cpp` |
+| NV12 打包 / 色彩转换 | 解码线程 | **CPU**（`memcpy` / libswscale） | 同上 |
+| 有界 NV12 队列 | 解码 → display bridge | CPU RAM | `xqc_bounded_frame_queue.hh`（深度 4，4K ≈ 48 MiB 峰值） |
+| PBO 上传 + 纹理 | display（GLFW） | **GPU**（OpenGL PBO `glTexSubImage2D`） | `xqc_nv12_gl_linux.cpp` |
+| YUV→RGB + 合成 | display | **GPU**（GLSL 3.3） | 同上 |
+| 呈现 | display | **GPU**（swapchain） | `glfwSwapBuffers`；E2E 采样点 |
+| E2E 直方图 | display 记录 / stats 打印 | CPU | `xqc_e2e_latency.hh`（`recv→display`、`wire_pts→display`） |
+
+**说明**：Linux/WSL 路径**未**使用 NVDEC/VAAPI/CUDA；Windows 可选 D3D11VA 硬解，但仍需在展示前落到 NV12。纯流内延迟测量建议：`--decode --display --no-eos-file-decode`，窗口按 **3840×2160** 预配（`xqc_video_target.hh`）。
+
+### 2.7 硬件解码 + EGL 零拷贝（Linux，4K 压测）
+
+**操作手册（WSL 编 FFmpeg + cmake + 测试全流程）**：见 **[`WSL_FFMPEG_HW_BUILD_AND_TEST.md`](WSL_FFMPEG_HW_BUILD_AND_TEST.md)**。
+
+构建要点：自编译 FFmpeg → 设置 `PKG_CONFIG_PATH` / `LD_LIBRARY_PATH` → `XQC_ENABLE_HW_DECODE=ON`。
+脚本：[`scripts/build_ffmpeg_hw_linux.sh`](../scripts/build_ffmpeg_hw_linux.sh)；E2E：[`scripts/wsl_video_e2e.sh`](../scripts/wsl_video_e2e.sh)。
+
+| 后端 | 解码 | 显示 | 启用方式 |
+|------|------|------|----------|
+| **VAAPI** | GPU (`hevc_vaapi` / `h264_vaapi`) | **dma-buf → EGLImage**（零拷贝） | `--codec hevc` + `--hw-decode=vaapi` |
+| **CUDA/NVDEC** | GPU (`hevc_cuvid` / `h264_cuvid`) | CPU NV12 → PBO | `--codec hevc` + `--hw-decode=cuda` |
+| **software** | CPU H.265/H.264 双栈 | PBO | `--hw-decode=off`；`--codec h264` 保留 H.264 |
+
+**远端 4K 压测（另一台电脑发流）**：
+
+```bash
+# 接收端（本机，WSLg 或 Linux 桌面）
+export XQC_VA_DEVICE=/dev/dri/renderD128
+./build_wsl/xquic_tests/xqc_video_receiver -p 8443 -c tests/server.crt -k tests/server.key \
+  --decode --display --codec hevc --no-eos-file-decode --hw-decode=auto
+
+# 发送端（另一台机器，替换 IP/码流）
+ffmpeg -f lavfi -i testsrc=size=3840x2160:rate=30 -t 60 -c:v libx264 -preset ultrafast \
+  -profile:v high -pix_fmt yuv420p -g 30 -f h264 - | \
+  ./video_client -a <RECEIVER_IP> -p 8443 --cam0 /dev/stdin --fps 30
+# 或先落盘: ffmpeg ... -f h264 cam4k.h264 && ./video_client ... --cam0 cam4k.h264 --fps 30
+```
+
+E2E 直方图见 `xqc_e2e_latency.hh`（`recv→display` / 锚定 `wire_pts→display`）。
+
 ---
 
 ## 3. 构建与产物
@@ -87,12 +149,14 @@ xquic 需发包时 → 静态回调 ss_write_socket()
 
 ## 4. 与「4K 低延迟解码显示」的关系（仓库现状）
 
-当前 Seastar 服务端示例中的 **video 模式**主要是：流上读数据 → 累积/解析帧头 → **写磁盘（如 H264 文件）**，**未集成** **HEVC + NVDEC 硬解**、**OpenGL PBO 显示** 或独立解码线程。若产品目标包含实时显示，需要在进程外或同进程新增**解码/渲染流水线**；规格化主路径见 **`docs/VIDEO_LOW_LATENCY_WINDOWS_DESIGN.md`**（**HEVC (H.265) 码流 → NVDEC → NV12 → OpenGL PBO（局域网优先 2 枚、公网可 3 枚）→ 全屏 shader**），并严格避免在 **Seastar reactor 线程** 上执行重 CPU/GPU 阻塞工作（与既有 AGENTS.md 中「避免阻塞回调」一致）。
+当前 Seastar 服务端 **`xquic_server_seastar` 的 video 模式**：在 **`on_stream_read_notify`** 中累积数据、按 **`xqc_video_frame`** 解析，**默认写磁盘**（如 `cam_*.h264`）。在开启 **`XQC_ENABLE_LOWLATENCY_FFMPEG`** 且运行时带上 **`--video-decode`** 时，同一解析路径会 **额外** 将 Annex-B 切片送入 **`XqcBoundedFrameQueue` + FFmpeg 解码线程**（reactor 不做重解码）；**OpenGL PBO 实时显示**仍属 **`VIDEO_LOW_LATENCY_WINDOWS_DESIGN.md`** 中的产品主路径（§0 数据流图、§5–§6），与 Seastar 示例二进制可同进程或分进程组合。
+
+若产品目标为 **HEVC + NVDEC + GL 全链路**，仍以 **`docs/VIDEO_LOW_LATENCY_WINDOWS_DESIGN.md`** 为规格源（**HEVC → NVDEC → NV12 → PBO → shader**），并严格避免在 **Seastar reactor 线程** 上执行长时间 `avcodec_*` / `glMapBuffer*`（与 `AGENTS.md` 中「避免阻塞回调」一致）。
 
 推荐边界：
 
 - **Reactor 线程**：只做收包、`xqc_engine_packet_process`、轻量入队、定时器与 flush 调度。
-- **解码/渲染**：独立线程（或专用 executor）+ 有界队列 +「最新帧优先」策略；解码侧 **H.265 + NVDEC**，显示侧 **OpenGL PBO**；与 `SEASTAR_ARCHITECTURE_ANALYSIS.md` 中的优化方向一致。
+- **解码/渲染**：独立线程（或专用 executor）+ 有界队列 +「最新帧优先」策略；解码侧 **H.265 + NVDEC**（或过渡阶段 **H.264**），显示侧 **OpenGL PBO**；与 `SEASTAR_ARCHITECTURE_ANALYSIS.md` 中的优化方向一致。
 
 ---
 
@@ -184,7 +248,8 @@ xquic 需发包时 → 静态回调 ss_write_socket()
 | `docs/PHASE3_SEASTAR_DPDK_SERVER_EVAL.md` | DPDK 阶段评估与 CSV 规范 |
 | `docs/DPDK_USAGE_GUIDE.md` | 环境配置与运行步骤 |
 | `docs/VIDEO_LOW_LATENCY_WINDOWS_DESIGN.md` | **HEVC + NVDEC + OpenGL PBO（2/3 与策略模式）** 显示链路与 Windows/绑核规格 |
-| `docs/VIDEO_LOW_LATENCY_WINDOWS_DEV_PLAN.md` | **Windows 构建与分阶段实施计划**（对齐设计文档与现有 CMake 差距） |
+| `docs/config/hevc_nvenc_low_latency.json` | **W4** `hevc_nvenc` 低延迟 CLI 模板（需与 `ffmpeg -h` 核对） |
+| `tests/lowlatency/README.md` | **W1–W5** 样例工具与头文件索引 |
 
 ---
 

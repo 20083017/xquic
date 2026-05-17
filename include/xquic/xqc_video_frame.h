@@ -173,6 +173,15 @@ xqc_video_h264_nal_type(uint8_t nal_header) {
 #define XQC_H264_NAL_SPS    7
 #define XQC_H264_NAL_PPS    8
 
+/* HEVC (H.265) — nal_unit_type in (first_byte >> 1) & 0x3F */
+#define XQC_HEVC_NAL_VPS    32
+#define XQC_HEVC_NAL_SPS    33
+#define XQC_HEVC_NAL_PPS    34
+#define XQC_HEVC_NAL_AUD    35
+#define XQC_HEVC_NAL_IDR_W_RADL  19
+#define XQC_HEVC_NAL_IDR_N_LP    20
+#define XQC_HEVC_NAL_CRA_N_LP    21
+
 /**
  * Map H.264 NAL type to our frame type.
  */
@@ -184,6 +193,27 @@ xqc_video_h264_nal_to_frame_type(uint8_t nal_type) {
     case XQC_H264_NAL_PPS: return XQC_VIDEO_FRAME_SPS_PPS;
     case XQC_H264_NAL_SEI: return XQC_VIDEO_FRAME_SEI;
     default:               return XQC_VIDEO_FRAME_P;
+    }
+}
+
+static inline uint8_t
+xqc_video_hevc_nal_type(uint8_t nal_header) {
+    return (uint8_t)((nal_header >> 1) & 0x3F);
+}
+
+static inline xqc_video_frame_type_t
+xqc_video_hevc_nal_to_frame_type(uint8_t nal_type) {
+    switch (nal_type) {
+    case XQC_HEVC_NAL_IDR_W_RADL:
+    case XQC_HEVC_NAL_IDR_N_LP:
+    case XQC_HEVC_NAL_CRA_N_LP:
+        return XQC_VIDEO_FRAME_IDR;
+    case XQC_HEVC_NAL_VPS:
+    case XQC_HEVC_NAL_SPS:
+    case XQC_HEVC_NAL_PPS:
+        return XQC_VIDEO_FRAME_SPS_PPS;
+  default:
+        return XQC_VIDEO_FRAME_P;
     }
 }
 

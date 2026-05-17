@@ -8,6 +8,9 @@ if(HAVE_CUNIT)
 endif()
 
 option(XQC_ENABLE_SEASTAR_EXAMPLE "Build Seastar integration example under tests/" OFF)
+option(XQC_ENABLE_LOWLATENCY_PHASES "Build W1-W5 low-latency sample tools (Windows: GPU selftest, NV12 viewer)" OFF)
+option(XQC_ENABLE_LOWLATENCY_FFMPEG "FFmpeg H.264 decode worker for video_client + xquic_server_seastar (vcpkg)" OFF)
+option(XQC_ENABLE_HW_DECODE "Linux VAAPI/CUDA hw decode + EGL dma-buf display (requires FFmpeg)" OFF)
 
 # find LibEvent include and library path
 find_package(LibEvent 2.0.21)
@@ -22,6 +25,20 @@ include_directories(
     ${CUNIT_INCLUDE_DIRS}
     ${LIBEVENT_INCLUDE_DIR}
 )
+
+set(LOWLATENCY_H264_DECODE_SOURCES lowlatency/xqc_h264_ff_decode_worker.cpp)
+
+if(XQC_ENABLE_LOWLATENCY_FFMPEG)
+    if(CMAKE_SYSTEM_NAME MATCHES "Windows")
+        find_package(ffmpeg CONFIG REQUIRED)
+        set(XQC_FFMPEG_LIBS ffmpeg::avcodec ffmpeg::avutil ffmpeg::swscale)
+    else()
+        find_package(PkgConfig REQUIRED)
+        pkg_check_modules(LIBAV REQUIRED IMPORTED_TARGET
+            libavcodec libavutil libswscale libavformat)
+        set(XQC_FFMPEG_LIBS PkgConfig::LIBAV)
+    endif()
+endif()
 
 set(TEST_SERVER_SOURCES
     test_server.cpp
@@ -82,7 +99,12 @@ set(VIDEO_CLIENT_SOURCES
     xqc_video_client.cpp
 )
 add_executable(video_client ${VIDEO_CLIENT_SOURCES})
-target_link_libraries(video_client ${APP_DEPEND_LIBS})
+target_sources(video_client PRIVATE ${LOWLATENCY_H264_DECODE_SOURCES})
+target_link_libraries(video_client PRIVATE ${APP_DEPEND_LIBS})
+if(XQC_ENABLE_LOWLATENCY_FFMPEG)
+    target_compile_definitions(video_client PRIVATE XQC_HAVE_FFMPEG=1)
+    target_link_libraries(video_client PRIVATE ${XQC_FFMPEG_LIBS})
+endif()
 
 # Video streaming benchmark client
 set(VIDEO_BENCH_SOURCES
@@ -90,6 +112,20 @@ set(VIDEO_BENCH_SOURCES
 )
 add_executable(video_bench ${VIDEO_BENCH_SOURCES})
 target_link_libraries(video_bench ${APP_DEPEND_LIBS})
+
+if(XQC_ENABLE_LOWLATENCY_PHASES AND CMAKE_SYSTEM_NAME MATCHES "Windows")
+    add_executable(xqc_gpu_windows_selftest
+        lowlatency/xqc_gpu_windows_selftest.cpp
+    )
+    target_compile_features(xqc_gpu_windows_selftest PRIVATE cxx_std_17)
+    target_link_libraries(xqc_gpu_windows_selftest PRIVATE opengl32 user32 gdi32)
+
+    add_executable(xqc_nv12_gl_pbo_viewer
+        lowlatency/xqc_nv12_gl_pbo_viewer.cpp
+    )
+    target_compile_features(xqc_nv12_gl_pbo_viewer PRIVATE cxx_std_17)
+    target_link_libraries(xqc_nv12_gl_pbo_viewer PRIVATE opengl32 user32 gdi32)
+endif()
 
 if(XQC_ENABLE_SEASTAR_EXAMPLE)
     # When XQC_ENABLE_SEASTAR is ON, Seastar is built from submodule
@@ -108,6 +144,7 @@ if(XQC_ENABLE_SEASTAR_EXAMPLE)
     add_executable(xquic_server_seastar
         xquic_server_seastar.cpp
     )
+    target_sources(xquic_server_seastar PRIVATE ${LOWLATENCY_H264_DECODE_SOURCES})
 
     target_compile_features(xquic_server_seastar PRIVATE cxx_std_20)
 
@@ -131,6 +168,10 @@ if(XQC_ENABLE_SEASTAR_EXAMPLE)
             pthread
         )
     endif()
+    if(XQC_ENABLE_LOWLATENCY_FFMPEG)
+        target_compile_definitions(xquic_server_seastar PRIVATE XQC_HAVE_FFMPEG=1)
+        target_link_libraries(xquic_server_seastar PRIVATE ${XQC_FFMPEG_LIBS})
+    endif()
 
     # POSIX + eBPF reuseport variant (Linux-only; not built on Windows)
     if(NOT CMAKE_SYSTEM_NAME MATCHES "Windows")
@@ -150,6 +191,49 @@ if(XQC_ENABLE_SEASTAR_EXAMPLE)
             pthread
         )
     endif()
+endif()
+
+if(XQC_ENABLE_LOWLATENCY_FFMPEG AND NOT CMAKE_SYSTEM_NAME MATCHES "Windows")
+    find_package(OpenGL REQUIRED)
+    find_package(PkgConfig QUIET)
+    if(PKG_CONFIG_FOUND)
+        pkg_check_modules(GLFW3 glfw3)
+    endif()
+    set(LOWLATENCY_H264_HW_SOURCES "")
+    if(XQC_ENABLE_HW_DECODE)
+        pkg_check_modules(EGL REQUIRED IMPORTED_TARGET egl)
+        pkg_check_modules(LIBVA REQUIRED IMPORTED_TARGET libva libva-drm)
+        pkg_check_modules(DRM REQUIRED IMPORTED_TARGET libdrm)
+        set(LOWLATENCY_H264_HW_SOURCES
+            lowlatency/xqc_h264_hw_linux.cpp
+            lowlatency/xqc_gl_egl_dma.cpp)
+    endif()
+    set(VIDEO_RECEIVER_SOURCES
+        xqc_video_receiver.cpp
+        ${LOWLATENCY_H264_DECODE_SOURCES}
+        ${LOWLATENCY_H264_HW_SOURCES}
+    )
+    if(GLFW3_FOUND)
+        list(APPEND VIDEO_RECEIVER_SOURCES lowlatency/xqc_nv12_gl_linux.cpp)
+    endif()
+    add_executable(xqc_video_receiver ${VIDEO_RECEIVER_SOURCES})
+    target_compile_features(xqc_video_receiver PRIVATE cxx_std_17)
+    target_compile_definitions(xqc_video_receiver PRIVATE XQC_HAVE_FFMPEG=1)
+    target_link_libraries(xqc_video_receiver PRIVATE ${APP_DEPEND_LIBS} ${XQC_FFMPEG_LIBS} OpenGL::GL)
+    if(XQC_ENABLE_HW_DECODE)
+        target_compile_definitions(xqc_video_receiver PRIVATE XQC_HAVE_HW_DECODE=1)
+        target_link_libraries(xqc_video_receiver PRIVATE PkgConfig::EGL PkgConfig::LIBVA PkgConfig::DRM)
+    endif()
+    if(GLFW3_FOUND)
+        target_compile_definitions(xqc_video_receiver PRIVATE XQC_HAVE_GLFW=1)
+        target_include_directories(xqc_video_receiver PRIVATE ${GLFW3_INCLUDE_DIRS})
+        target_link_libraries(xqc_video_receiver PRIVATE ${GLFW3_LIBRARIES})
+    endif()
+
+    add_executable(xqc_h264_decode_smoke lowlatency/xqc_h264_decode_smoke.cpp ${LOWLATENCY_H264_DECODE_SOURCES})
+    target_compile_features(xqc_h264_decode_smoke PRIVATE cxx_std_17)
+    target_compile_definitions(xqc_h264_decode_smoke PRIVATE XQC_HAVE_FFMPEG=1)
+    target_link_libraries(xqc_h264_decode_smoke PRIVATE ${XQC_FFMPEG_LIBS})
 endif()
 
 

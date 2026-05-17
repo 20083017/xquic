@@ -1,6 +1,6 @@
 # 4K 低延迟：HEVC (H.265) + NVDEC + OpenGL PBO（Windows / Optimus / 8750H）
 
-本文在 `docs/DPDK_SEASTAR_XQUIC_ARCHITECTURE_AND_ROADMAP.md` 的媒体边界之上，把**主播放链路**写死为下面一条可实现的规格，并补充有界帧队列、AVFrame 生命周期、独显约束与绑核。
+本文在 `docs/DPDK_SEASTAR_XQUIC_ARCHITECTURE_AND_ROADMAP.md` 的媒体边界之上（**视频 UDP 进入 Seastar / `xqc_engine_packet_process` 的位置见该文 §2.5**），把**主播放链路**写死为下面一条可实现的规格，并补充有界帧队列、AVFrame 生命周期、独显约束与绑核。
 
 **实施顺序与验收阶段**（与当前 CMake/代码差距对照）：见 **[`VIDEO_LOW_LATENCY_WINDOWS_DEV_PLAN.md`](./VIDEO_LOW_LATENCY_WINDOWS_DEV_PLAN.md)**。
 
@@ -11,6 +11,93 @@
 **编码侧（发送，与上链对称但方向相反）**：**`hevc_nvenc`**（同机 4K 低延迟参数集）；**无 `av1_nvenc`**（Pascal / 1050 Ti）。
 
 目标硬件仍以 **i7-8750H + GTX 1050 Ti Max-Q** 为基线。
+
+---
+
+## 0. 视频数据流与架构总览
+
+本节给出 **端到端视频数据流** 与 **分层架构图**，与下文 §1（队列）、§5（PBO）、§6（FFmpeg/NVDEC）、§8（与 Seastar 边界）一致；实现样例见 `tests/lowlatency/`、`video_client`、`xquic_server_seastar`（可选 `XQC_ENABLE_LOWLATENCY_FFMPEG`）。
+
+### 0.1 端到端数据流（发送 → 网络 → 收流 → 解码 → 呈现）
+
+逻辑顺序：**采集/文件 → 封装（xquic 视频帧头）→ QUIC 字节流 → 对端重组 Annex-B →（可选）落盘与/或有界队列 → 解码线程 → NV12 →（可选）OpenGL PBO 显示**。
+
+```mermaid
+flowchart LR
+  subgraph Send["发送侧"]
+    A["摄像机 / 文件\n(H.264 / HEVC Annex-B)"]
+    B["NAL 切分 + 帧头\nxqc_video_frame_header_t"]
+    C["QUIC transport 流\nALPN: transport"]
+    A --> B --> C
+  end
+  subgraph Net["网络"]
+    N["UDP / QUIC\n(重传、乱序由 xQUIC 处理)"]
+    C --> N
+  end
+  subgraph Recv["接收侧（示例：Seastar 或 libevent）"]
+    R1["xqc_stream_recv\n累积 recv_body"]
+    R2["按 16B 头解析\n完整 NAL payload"]
+    R3["Annex-B 写盘\n*.h264（可选）"]
+    R4["XqcBoundedFrameQueue\npush_drop_oldest"]
+    N --> R1 --> R2 --> R3
+    R2 --> R4
+  end
+  subgraph Decode["reactor / 回调外"]
+    D1["解码专用线程\nFFmpeg avcodec"]
+    D2["NV12 / GPU 表面\n(+ hwdownload 若需 PBO)"]
+    R4 --> D1 --> D2
+  end
+  subgraph Present["显示（可选第二线程 / 主线程 GL）"]
+    P1["GL_PIXEL_UNPACK_BUFFER\n2 或 3（§5.3）"]
+    P2["R8 + RG8 纹理 + shader\nBT.709/2020"]
+    P3["SwapBuffers / V-Sync"]
+    D2 --> P1 --> P2 --> P3
+  end
+```
+
+**要点（与 §8 对齐）**
+
+- **reactor / `on_stream_read_notify`**：只做 **收字节、解析 wire、入队**；**禁止**在此路径内长时间 `avcodec_receive_frame` / `glMapBufferRange`。
+- **两条抖动吸收带**：**解码前** 有界队列（§1）丢弃最旧、保最新；**解码后** PBO 环（§5）吸收「上传 vs V-Sync」错位。
+- **当前仓库增量**：`xquic_server_seastar --video --video-decode` 将 Annex-B 切片送入 **单解码线程**；`video_client --decode-preview` 在发送侧 **镜像** 同一路径做本机验证（非对端回环）。
+
+### 0.2 分层架构图（职责边界）
+
+```mermaid
+flowchart TB
+  subgraph L5["L5 业务 / 会话"]
+    BC["会话生命周期\n连接、相机 ID、EOS"]
+  end
+  subgraph L4["L4 媒体封装"]
+    WF["xquic 视频 wire\n16B 头 + NAL RBSP"]
+  end
+  subgraph L3["L3 传输"]
+    XQ["libxquic\n流、加密、拥塞控制"]
+    QUIC["QUIC / UDP"]
+  end
+  subgraph L2["L2 I/O 与调度"]
+    IO["Seastar reactor shard\n或 libevent + UDP"]
+  end
+  subgraph L1["L1 解码与呈现（默认不在 reactor）"]
+    Q["XqcBoundedFrameQueue"]
+    DEC["FFmpeg\nH.264 / HEVC + NVDEC/D3D11VA"]
+    GL["OpenGL\nNV12 + PBO 策略"]
+  end
+  BC --> WF --> XQ --> QUIC --> IO
+  IO -->|"收流回调：仅拆帧/入队"| Q
+  Q --> DEC --> GL
+```
+
+**与 `DPDK_SEASTAR_XQUIC_ARCHITECTURE_AND_ROADMAP.md` 的关系**：DPDK 仅作为 Seastar **可选网络后端**；**视频字节**仍经 **同一 `xqc_engine_packet_process` → 流回调** 进入上图 **L4**；**解码/GL** 不依赖 DPDK 是否存在。
+
+### 0.3 关键对象与线程（实现对照）
+
+| 环节 | 典型线程 / 上下文 | 仓库落点（示例） |
+|------|-------------------|------------------|
+| 发送封装 | `video_client` libevent 回调 | `tests/xqc_video_client.cpp`、`xqc_video_frame.h` |
+| 收流解析 | Seastar shard reactor **或** `test_server` 同构回调 | `tests/xquic_server_seastar.cpp` 中 `process_video_frames` |
+| 有界队列 + 解码 | **独立 `std::thread`** | `tests/lowlatency/xqc_h264_ff_decode_worker.cpp`、`xqc_bounded_frame_queue.hh` |
+| PBO 策略 | **渲染线程 / WGL** | `tests/lowlatency/xqc_pbo_dynamic_manager.hh`、`xqc_nv12_gl_pbo_viewer.cpp` |
 
 ---
 
@@ -224,5 +311,6 @@ ffmpeg -h encoder=hevc_nvenc
 
 ---
 
-**版本**：1.2 — 补充 **2/3 PBO 场景选择、原理、策略模式动态管理器、XPS 9570 对比观测指标**  
+**版本**：1.3 — 新增 **§0 视频数据流与分层架构图（Mermaid）**、与仓库收流/解码线程对照表；1.2 起已含 2/3 PBO、策略模式与 XPS 9570 观测指标  
+**实现样例（W1–W5）**：见 **[`tests/lowlatency/README.md`](../tests/lowlatency/README.md)**（CMake 开关 `XQC_ENABLE_LOWLATENCY_PHASES`）。  
 **后续**：实现阶段建议为 `hevc_nvenc` 参数集保存 **版本化 JSON**（含 FFmpeg commit 或 `--version` 字符串），便于回归对比延迟曲线；**NVDEC** 与 **PBO 策略（2/3）** 版本号可记入同一份 manifest。
