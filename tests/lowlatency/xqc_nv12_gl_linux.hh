@@ -10,7 +10,11 @@
  * @class XqcNv12GlLinux
  * @brief Dedicated GLFW thread: CPU NV12 → GPU textures → fullscreen quad (WSLg / Linux).
  *
- * **GPU usage summary** (Linux/WSL path):
+ * **Display paths** (pick one per GPU — see `xqc_h264_hw_display_use_egl()`):
+ * - **NVIDIA**: CUDA/NVDEC → CPU NV12 → **GLX + PBO** (below).
+ * - **Intel/AMD**: VAAPI → **EGL + DMA-BUF** (`xqc_gl_egl_dma.cpp`, zero-copy).
+ *
+ * **GLX + PBO path** (NVIDIA):
  * 1. CPU holds decoded NV12 in `XqcNv12Frame::data`.
  * 2. `glMapBufferRange` on a **PIXEL_UNPACK_BUFFER** (dual PBO ping-pong) — DMA-style upload to VRAM.
  * 3. `glTexSubImage2D` from PBO into **R8** (Y) and **RG8** (UV) textures (no CPU→texture direct path).

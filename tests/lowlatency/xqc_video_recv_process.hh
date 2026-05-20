@@ -25,9 +25,11 @@
 
 #include "xqc_h264_ff_decode_api.hh"
 #include "xqc_video_codec.hh"
+#include "xqc_video_low_latency.hh"
 
 #include <xquic/xqc_video_frame.h>
 
+#include <atomic>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -96,14 +98,27 @@ inline bool xqc_process_video_stream_buffer(
         std::fwrite(data + offset + XQC_VIDEO_FRAME_HEADER_LEN, 1, hdr.payload_len, recv_body_fp);
 
         if (stream_decode) {
-            /* Stamp receive time before crossing reactor → decode thread boundary. */
             const uint64_t recv_us = xqc_video_recv_now_us();
-            std::vector<unsigned char> annexb(sizeof(kStart) + hdr.payload_len);
-            std::memcpy(annexb.data(), kStart, sizeof(kStart));
-            std::memcpy(annexb.data() + sizeof(kStart),
-                data + offset + XQC_VIDEO_FRAME_HEADER_LEN, hdr.payload_len);
-            xqc_h264_decode_push_annexb_ts(hdr.camera_id, annexb.data(), annexb.size(),
-                hdr.pts_us, recv_us);
+            const uint8_t* rbsp = data + offset + XQC_VIDEO_FRAME_HEADER_LEN;
+            const int rbsp_len = static_cast<int>(hdr.payload_len);
+            const bool key_nal = xqc_annexb_is_key_nal(record_codec, rbsp, rbsp_len);
+            const std::size_t qdepth = xqc_h264_decode_annexb_queue_depth();
+            const std::size_t qdrop = xqc_video_decode_queue_drop_threshold();
+            if (qdepth >= qdrop && !key_nal) {
+                static std::atomic<uint64_t> dropped{0};
+                const uint64_t n = dropped.fetch_add(1) + 1;
+                if ((n & 127u) == 1u) {
+                    std::fprintf(stderr,
+                        "[video] catch-up: dropped stale NAL (queue=%zu threshold=%zu total=%llu)\n",
+                        qdepth, qdrop, static_cast<unsigned long long>(n));
+                }
+            } else {
+                std::vector<unsigned char> annexb(sizeof(kStart) + hdr.payload_len);
+                std::memcpy(annexb.data(), kStart, sizeof(kStart));
+                std::memcpy(annexb.data() + sizeof(kStart), rbsp, hdr.payload_len);
+                xqc_h264_decode_push_annexb_ts(hdr.camera_id, annexb.data(), annexb.size(),
+                    hdr.pts_us, recv_us);
+            }
         }
 
         offset += XQC_VIDEO_FRAME_HEADER_LEN + hdr.payload_len;

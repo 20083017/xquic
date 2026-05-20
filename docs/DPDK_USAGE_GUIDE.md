@@ -11,7 +11,7 @@
 3. [安装 DPDK 工具包](#3-安装-dpdk-工具包)
 4. [添加第二块网卡（管理口）](#4-添加第二块网卡管理口)
 5. [绑定网卡到 DPDK 驱动](#5-绑定网卡到-dpdk-驱动)
-6. [验证 DPDK 基本功能](#6-验证-dpdk-基本功能)
+6. [验证 DPDK 基本功能dpd](#6-验证-dpdk-基本功能)
 7. [构建 Seastar DPDK 服务端](#7-构建-seastar-dpdk-服务端)
 8. [启动 DPDK 模式服务端](#8-启动-dpdk-模式服务端)
 9. [压测与对比](#9-压测与对比)
@@ -24,13 +24,15 @@
 
 ### 系统要求
 
-| 项目 | 最低要求 | 推荐 |
-|---|---|---|
-| CPU 核数 | 2 | 4+ |
-| 内存 | 2 GB | 4 GB+ |
-| 网卡 | 1 块 virtio | 2 块（1 管理 + 1 DPDK） |
-| 内核 | 4.4+ | 5.x+ |
-| DPDK | 21.x+ | 与 libdpdk-dev 版本一致 |
+
+| 项目     | 最低要求       | 推荐                 |
+| ------ | ---------- | ------------------ |
+| CPU 核数 | 2          | 4+                 |
+| 内存     | 2 GB       | 4 GB+              |
+| 网卡     | 1 块 virtio | 2 块（1 管理 + 1 DPDK） |
+| 内核     | 4.4+       | 5.x+               |
+| DPDK   | 21.x+      | 与 libdpdk-dev 版本一致 |
+
 
 ### 确认编译环境
 
@@ -108,7 +110,7 @@ find /usr -name "dpdk-devbind.py" 2>/dev/null
 
 ---
 
-## 4. 添加第二块网卡（管理口）
+## 4. 添加第二块网卡（管理口）ffmpe
 
 > **⚠️ 关键步骤**: 绑定网卡到 DPDK 后，该网卡将脱离 Linux 内核协议栈，
 > 网络连接（包括 SSH）会断开。必须有第二块网卡维持管理通道。
@@ -117,9 +119,9 @@ find /usr -name "dpdk-devbind.py" 2>/dev/null
 
 1. 关闭虚拟机
 2. **设置 → 网络 → 网卡 2**:
-   - 勾选「启用网络连接」
-   - 连接方式: **仅主机(Host-Only)网络**（用于管理 SSH）
-   - 高级 → 适配器类型: **Paravirtualized Network (virtio-net)**
+  - 勾选「启用网络连接」
+  - 连接方式: **仅主机(Host-Only)网络**（用于管理 SSH）
+  - 高级 → 适配器类型: **Paravirtualized Network (virtio-net)**
 3. **网卡 1** 保持原样（NAT 或桥接），这块将绑定到 DPDK
 4. 启动虚拟机
 
@@ -141,6 +143,7 @@ sudo ip link set enp0s8 up
 ### 如果只有一块网卡
 
 如果无法添加第二块网卡，可以：
+
 - 直接在 VirtualBox 控制台（GUI）操作，不依赖 SSH
 - 或使用 `virtio-user` 虚拟设备（不绑定物理网卡），见 [Section 6](#6-验证-dpdk-基本功能)
 
@@ -310,17 +313,19 @@ sudo ./build_seastar_dpdk/xquic_tests/xquic_server_seastar \
 
 ### 关键启动参数说明
 
-| 参数 | 说明 | 默认值 |
-|---|---|---|
-| `--smp N` | 使用 N 个 CPU 核 | 所有核 |
-| `--dpdk-pmd` | 启用 DPDK Poll-Mode Driver | 关闭 |
-| `--dpdk-port-index N` | 使用第 N 个 DPDK 端口 | 0 |
-| `--network-stack native` | 使用 Seastar 原生网络栈（含 DPDK） | posix |
-| `--hugepages PATH` | Hugepages 挂载路径 | /dev/hugepages |
-| `-p PORT` | QUIC 监听 UDP 端口 | 8443 |
-| `--cert FILE` | TLS 证书路径 | ./server.crt |
-| `--key FILE` | TLS 私钥路径 | ./server.key |
-| `-e / --echo` | 回显模式 | 关闭 |
+
+| 参数                       | 说明                       | 默认值            |
+| ------------------------ | ------------------------ | -------------- |
+| `--smp N`                | 使用 N 个 CPU 核             | 所有核            |
+| `--dpdk-pmd`             | 启用 DPDK Poll-Mode Driver | 关闭             |
+| `--dpdk-port-index N`    | 使用第 N 个 DPDK 端口          | 0              |
+| `--network-stack native` | 使用 Seastar 原生网络栈（含 DPDK） | posix          |
+| `--hugepages PATH`       | Hugepages 挂载路径           | /dev/hugepages |
+| `-p PORT`                | QUIC 监听 UDP 端口           | 8443           |
+| `--cert FILE`            | TLS 证书路径                 | ./server.crt   |
+| `--key FILE`             | TLS 私钥路径                 | ./server.key   |
+| `-e / --echo`            | 回显模式                     | 关闭             |
+
 
 ---
 
@@ -328,12 +333,14 @@ sudo ./build_seastar_dpdk/xquic_tests/xquic_server_seastar \
 
 ### 测试矩阵
 
-| 配置 | 命令 |
-|---|---|
-| POSIX smp=1 | `./xquic_server_seastar --smp 1 -p 8443 ...` |
-| POSIX smp=2 | `./xquic_server_seastar --smp 2 -p 8443 ...` |
-| DPDK smp=1 | `sudo ./xquic_server_seastar --smp 1 --dpdk-pmd --network-stack native ...` |
-| DPDK smp=2 | `sudo ./xquic_server_seastar --smp 2 --dpdk-pmd --network-stack native ...` |
+
+| 配置          | 命令                                                                          |
+| ----------- | --------------------------------------------------------------------------- |
+| POSIX smp=1 | `./xquic_server_seastar --smp 1 -p 8443 ...`                                |
+| POSIX smp=2 | `./xquic_server_seastar --smp 2 -p 8443 ...`                                |
+| DPDK smp=1  | `sudo ./xquic_server_seastar --smp 1 --dpdk-pmd --network-stack native ...` |
+| DPDK smp=2  | `sudo ./xquic_server_seastar --smp 2 --dpdk-pmd --network-stack native ...` |
+
 
 ### 客户端压测（从另一台机器或宿主机）
 
@@ -360,13 +367,15 @@ sudo perf report
 
 ### 对比维度
 
-| 指标 | 采集方式 | 单位 |
-|---|---|---|
-| 吞吐量 | 服务端 stats 输出 | Mbps |
-| 包速率 | 服务端 stats 输出 | pps |
-| 延迟 | 客户端 RTT 统计 | ms / μs |
-| CPU 占用 | `mpstat` / `top` | % |
-| 并发连接 | 客户端参数控制 | 连接数 |
+
+| 指标     | 采集方式             | 单位      |
+| ------ | ---------------- | ------- |
+| 吞吐量    | 服务端 stats 输出     | Mbps    |
+| 包速率    | 服务端 stats 输出     | pps     |
+| 延迟     | 客户端 RTT 统计       | ms / μs |
+| CPU 占用 | `mpstat` / `top` | %       |
+| 并发连接   | 客户端参数控制          | 连接数     |
+
 
 ---
 
@@ -390,6 +399,7 @@ sudo dhclient enp0s3
 ## 11. 常见问题
 
 ### Q: `EAL: No free hugepages reported`
+
 **A:** Hugepages 未配置或已被占用。
 
 ```bash
@@ -398,6 +408,7 @@ cat /proc/meminfo | grep HugePages_
 ```
 
 ### Q: `EAL: Cannot init VFIO`
+
 **A:** VirtualBox 不支持 IOMMU。改用 `uio_pci_generic`:
 
 ```bash
@@ -406,6 +417,7 @@ sudo dpdk-devbind.py --bind=uio_pci_generic 0000:00:03.0
 ```
 
 ### Q: `EAL: No probed ethernet devices`
+
 **A:** 没有网卡绑定到 DPDK 驱动。检查:
 
 ```bash
@@ -413,6 +425,7 @@ sudo dpdk-devbind.py --status
 ```
 
 ### Q: 绑定后 SSH 断开
+
 **A:** 你绑定了管理口到 DPDK。通过 VirtualBox 控制台恢复:
 
 ```bash
@@ -421,14 +434,18 @@ sudo ip link set enp0s3 up && sudo dhclient enp0s3
 ```
 
 ### Q: `rte_ethdev.h: No such file or directory`
+
 **A:** DPDK 头文件路径问题，已在 Seastar 子模块中修复。确保使用修补后的 `Finddpdk.cmake`。
 
 ### Q: Seastar 服务端 DPDK 模式下无法收包
+
 **A:** 检查:
+
 1. hugepages 已分配: `grep HugePages_Free /proc/meminfo`
 2. 网卡已绑定: `dpdk-devbind.py --status`
 3. 使用了正确参数: `--dpdk-pmd --network-stack native`
 4. 以 root 运行: `sudo ./xquic_server_seastar ...`
 
 ### Q: 只想测试 DPDK 编译是否正确，不想绑定网卡
+
 **A:** 用 POSIX 模式运行 DPDK 编译的二进制即可（不加 `--dpdk-pmd`），它会使用内核网络栈，但链接了 DPDK 库。

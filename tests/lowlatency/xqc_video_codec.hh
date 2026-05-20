@@ -67,6 +67,22 @@ inline enum AVCodecID xqc_video_codec_av_id(XqcVideoCodec c) {
 }
 #endif
 
+/** True for IDR/CRA (HEVC) or IDR (H.264) — used for catch-up drop on backlog. */
+inline bool xqc_annexb_is_key_nal(XqcVideoCodec codec, const uint8_t* nal, int size) {
+    if (!nal || size < 1) {
+        return false;
+    }
+    if (codec == XqcVideoCodec::HEVC) {
+        if (size < 2) {
+            return false;
+        }
+        const uint8_t t = static_cast<uint8_t>((nal[0] >> 1) & 0x3f);
+        return t == 19 || t == 20 || t == 21 || t == 32 || t == 33 || t == 34;
+    }
+    const uint8_t t = static_cast<uint8_t>(nal[0] & 0x1f);
+    return t == 5 || t == 7 || t == 8;
+}
+
 inline bool xqc_annexb_should_feed_nal(XqcVideoCodec codec, const uint8_t* nal, int size) {
     if (!nal || size < 1) {
         return false;

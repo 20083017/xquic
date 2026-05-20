@@ -11,6 +11,14 @@ option(XQC_ENABLE_SEASTAR_EXAMPLE "Build Seastar integration example under tests
 option(XQC_ENABLE_LOWLATENCY_PHASES "Build W1-W5 low-latency sample tools (Windows: GPU selftest, NV12 viewer)" OFF)
 option(XQC_ENABLE_LOWLATENCY_FFMPEG "FFmpeg H.264 decode worker for video_client + xquic_server_seastar (vcpkg)" OFF)
 option(XQC_ENABLE_HW_DECODE "Linux VAAPI/CUDA hw decode + EGL dma-buf display (requires FFmpeg)" OFF)
+option(XQC_ENABLE_RTP_ANNEXB_RECEIVER "Build POSIX RTP/H.264 to Annex-B receiver for macOS/Linux roadmap Phase 1/2" ON)
+option(XQC_ENABLE_DPDK_RTP_RX "Build DPDK UDP/RTP receive smoke tool for Linux roadmap Phase 1" OFF)
+option(XQC_ENABLE_DRM_KMS_SMOKE "Build non-destructive DRM/KMS smoke tool for Linux roadmap Phase 5" OFF)
+option(XQC_ENABLE_GPUDIRECT_ENV_CHECK "Build GPUDirect RDMA environment checker for roadmap Phase 6" ON)
+option(XQC_ENABLE_NV12_MOSAIC_SMOKE "Build NV12 mosaic smoke tool for roadmap Phase 8" ON)
+option(XQC_ENABLE_SPSC_RING_SMOKE "Build lock-free SPSC ring smoke tool for system memory model" ON)
+option(XQC_ENABLE_CUDA_MEMORY_SMOKE "Build CUDA pinned/registered memory smoke tool for GPUDirect preflight" OFF)
+option(XQC_ENABLE_CUDA_GL_INTEROP_SMOKE "Build CUDA/OpenGL interop smoke tool for NVIDIA zero-copy display preflight" OFF)
 
 # find LibEvent include and library path
 find_package(LibEvent 2.0.21)
@@ -26,7 +34,11 @@ include_directories(
     ${LIBEVENT_INCLUDE_DIR}
 )
 
-set(LOWLATENCY_H264_DECODE_SOURCES lowlatency/xqc_h264_ff_decode_worker.cpp)
+set(LOWLATENCY_H264_DECODE_SOURCES
+    lowlatency/xqc_h264_ff_decode_worker.cpp
+    lowlatency/xqc_thread_affinity.cpp
+    lowlatency/xqc_nvidia_prime_env.cpp
+)
 
 if(XQC_ENABLE_LOWLATENCY_FFMPEG)
     if(CMAKE_SYSTEM_NAME MATCHES "Windows")
@@ -112,6 +124,89 @@ set(VIDEO_BENCH_SOURCES
 )
 add_executable(video_bench ${VIDEO_BENCH_SOURCES})
 target_link_libraries(video_bench ${APP_DEPEND_LIBS})
+
+if(XQC_ENABLE_RTP_ANNEXB_RECEIVER AND NOT CMAKE_SYSTEM_NAME MATCHES "Windows")
+    add_executable(xqc_rtp_annexb_receiver
+        lowlatency/xqc_rtp_annexb_receiver.cpp
+    )
+    target_compile_features(xqc_rtp_annexb_receiver PRIVATE cxx_std_17)
+endif()
+
+if(XQC_ENABLE_DPDK_RTP_RX)
+    if(CMAKE_SYSTEM_NAME MATCHES "Linux")
+        find_package(PkgConfig REQUIRED)
+        pkg_check_modules(DPDK REQUIRED IMPORTED_TARGET libdpdk)
+        add_executable(xqc_dpdk_rtp_rx
+            lowlatency/xqc_dpdk_rtp_rx.cpp
+        )
+        target_compile_features(xqc_dpdk_rtp_rx PRIVATE cxx_std_17)
+        target_link_libraries(xqc_dpdk_rtp_rx PRIVATE PkgConfig::DPDK)
+    else()
+        message(FATAL_ERROR "XQC_ENABLE_DPDK_RTP_RX is Linux-only")
+    endif()
+endif()
+
+if(XQC_ENABLE_DRM_KMS_SMOKE)
+    if(CMAKE_SYSTEM_NAME MATCHES "Linux")
+        find_package(PkgConfig REQUIRED)
+        pkg_check_modules(LIBDRM REQUIRED IMPORTED_TARGET libdrm)
+        add_executable(xqc_drm_kms_smoke
+            lowlatency/xqc_drm_kms_smoke.cpp
+        )
+        target_compile_features(xqc_drm_kms_smoke PRIVATE cxx_std_17)
+        target_link_libraries(xqc_drm_kms_smoke PRIVATE PkgConfig::LIBDRM)
+    else()
+        message(FATAL_ERROR "XQC_ENABLE_DRM_KMS_SMOKE is Linux-only")
+    endif()
+endif()
+
+if(XQC_ENABLE_GPUDIRECT_ENV_CHECK AND NOT CMAKE_SYSTEM_NAME MATCHES "Windows")
+    add_executable(xqc_gpudirect_env_check
+        lowlatency/xqc_gpudirect_env_check.cpp
+    )
+    target_compile_features(xqc_gpudirect_env_check PRIVATE cxx_std_17)
+endif()
+
+if(XQC_ENABLE_NV12_MOSAIC_SMOKE)
+    add_executable(xqc_nv12_mosaic_smoke
+        lowlatency/xqc_nv12_mosaic_smoke.cpp
+    )
+    target_compile_features(xqc_nv12_mosaic_smoke PRIVATE cxx_std_17)
+endif()
+
+if(XQC_ENABLE_SPSC_RING_SMOKE)
+    add_executable(xqc_spsc_ring_smoke
+        lowlatency/xqc_spsc_ring_smoke.cpp
+    )
+    target_compile_features(xqc_spsc_ring_smoke PRIVATE cxx_std_17)
+endif()
+
+if(XQC_ENABLE_CUDA_MEMORY_SMOKE OR XQC_ENABLE_CUDA_GL_INTEROP_SMOKE)
+    if(CMAKE_SYSTEM_NAME MATCHES "Linux")
+        find_package(CUDAToolkit REQUIRED)
+    else()
+        message(FATAL_ERROR "CUDA smoke tools are Linux-only")
+    endif()
+endif()
+
+if(XQC_ENABLE_CUDA_MEMORY_SMOKE)
+    add_executable(xqc_cuda_memory_smoke
+        lowlatency/xqc_cuda_memory_smoke.cpp
+    )
+    target_compile_features(xqc_cuda_memory_smoke PRIVATE cxx_std_17)
+    target_link_libraries(xqc_cuda_memory_smoke PRIVATE CUDA::cudart)
+endif()
+
+if(XQC_ENABLE_CUDA_GL_INTEROP_SMOKE)
+    find_package(OpenGL REQUIRED)
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(GLFW3 REQUIRED IMPORTED_TARGET glfw3)
+    add_executable(xqc_cuda_gl_interop_smoke
+        lowlatency/xqc_cuda_gl_interop_smoke.cpp
+    )
+    target_compile_features(xqc_cuda_gl_interop_smoke PRIVATE cxx_std_17)
+    target_link_libraries(xqc_cuda_gl_interop_smoke PRIVATE CUDA::cudart OpenGL::GL PkgConfig::GLFW3)
+endif()
 
 if(XQC_ENABLE_LOWLATENCY_PHASES AND CMAKE_SYSTEM_NAME MATCHES "Windows")
     add_executable(xqc_gpu_windows_selftest
@@ -204,30 +299,90 @@ if(XQC_ENABLE_LOWLATENCY_FFMPEG AND NOT CMAKE_SYSTEM_NAME MATCHES "Windows")
         pkg_check_modules(EGL REQUIRED IMPORTED_TARGET egl)
         pkg_check_modules(LIBVA REQUIRED IMPORTED_TARGET libva libva-drm)
         pkg_check_modules(DRM REQUIRED IMPORTED_TARGET libdrm)
+        find_package(CUDAToolkit QUIET)
         set(LOWLATENCY_H264_HW_SOURCES
             lowlatency/xqc_h264_hw_linux.cpp
             lowlatency/xqc_gl_egl_dma.cpp)
+        if(CUDAToolkit_FOUND)
+            list(APPEND LOWLATENCY_H264_HW_SOURCES lowlatency/xqc_cuda_gl_nv12.cpp)
+        endif()
     endif()
-    set(VIDEO_RECEIVER_SOURCES
-        xqc_video_receiver.cpp
+    set(VIDEO_RECEIVER_PIPELINE_SOURCES
+        lowlatency/xqc_video_receiver_pipeline.cpp
         ${LOWLATENCY_H264_DECODE_SOURCES}
         ${LOWLATENCY_H264_HW_SOURCES}
     )
     if(GLFW3_FOUND)
-        list(APPEND VIDEO_RECEIVER_SOURCES lowlatency/xqc_nv12_gl_linux.cpp)
+        list(APPEND VIDEO_RECEIVER_PIPELINE_SOURCES lowlatency/xqc_nv12_gl_linux.cpp)
     endif()
-    add_executable(xqc_video_receiver ${VIDEO_RECEIVER_SOURCES})
-    target_compile_features(xqc_video_receiver PRIVATE cxx_std_17)
-    target_compile_definitions(xqc_video_receiver PRIVATE XQC_HAVE_FFMPEG=1)
-    target_link_libraries(xqc_video_receiver PRIVATE ${APP_DEPEND_LIBS} ${XQC_FFMPEG_LIBS} OpenGL::GL)
-    if(XQC_ENABLE_HW_DECODE)
-        target_compile_definitions(xqc_video_receiver PRIVATE XQC_HAVE_HW_DECODE=1)
-        target_link_libraries(xqc_video_receiver PRIVATE PkgConfig::EGL PkgConfig::LIBVA PkgConfig::DRM)
-    endif()
-    if(GLFW3_FOUND)
-        target_compile_definitions(xqc_video_receiver PRIVATE XQC_HAVE_GLFW=1)
-        target_include_directories(xqc_video_receiver PRIVATE ${GLFW3_INCLUDE_DIRS})
-        target_link_libraries(xqc_video_receiver PRIVATE ${GLFW3_LIBRARIES})
+
+    if(XQC_ENABLE_SEASTAR_EXAMPLE)
+        if(TARGET Seastar::seastar)
+            set(XQC_SEASTAR_RECV_LINK Seastar::seastar)
+        elseif(TARGET PkgConfig::SEASTAR)
+            set(XQC_SEASTAR_RECV_LINK PkgConfig::SEASTAR)
+        else()
+            find_package(PkgConfig REQUIRED)
+            pkg_check_modules(SEASTAR REQUIRED IMPORTED_TARGET seastar)
+            set(XQC_SEASTAR_RECV_LINK PkgConfig::SEASTAR)
+        endif()
+
+        add_executable(xqc_video_receiver
+            xqc_video_receiver_seastar.cpp
+            ${VIDEO_RECEIVER_PIPELINE_SOURCES}
+        )
+        target_compile_features(xqc_video_receiver PRIVATE cxx_std_20)
+        target_compile_definitions(xqc_video_receiver PRIVATE XQC_HAVE_FFMPEG=1)
+        target_link_libraries(xqc_video_receiver PRIVATE
+            xquic-static
+            ${XQC_SEASTAR_RECV_LINK}
+            ${APP_DEPEND_LIBS}
+            ${XQC_FFMPEG_LIBS}
+            OpenGL::GL
+            m dl pthread
+        )
+        if(XQC_ENABLE_HW_DECODE)
+            target_compile_definitions(xqc_video_receiver PRIVATE XQC_HAVE_HW_DECODE=1)
+            target_link_libraries(xqc_video_receiver PRIVATE PkgConfig::EGL PkgConfig::LIBVA PkgConfig::DRM)
+            if(CUDAToolkit_FOUND)
+                target_compile_definitions(xqc_video_receiver PRIVATE XQC_HAVE_CUDA_GL=1)
+                target_link_libraries(xqc_video_receiver PRIVATE CUDA::cudart)
+            endif()
+        endif()
+        if(GLFW3_FOUND)
+            target_compile_definitions(xqc_video_receiver PRIVATE XQC_HAVE_GLFW=1)
+            target_include_directories(xqc_video_receiver PRIVATE ${GLFW3_INCLUDE_DIRS})
+            target_link_libraries(xqc_video_receiver PRIVATE ${GLFW3_LIBRARIES})
+        endif()
+        add_custom_command(TARGET xqc_video_receiver POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E create_symlink
+                xqc_video_receiver xqc_video_receiver_seastar
+            WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
+            COMMENT "Symlink xqc_video_receiver_seastar -> xqc_video_receiver"
+        )
+    else()
+        add_executable(xqc_video_receiver
+            xqc_video_receiver.cpp
+            ${VIDEO_RECEIVER_PIPELINE_SOURCES}
+        )
+        target_compile_features(xqc_video_receiver PRIVATE cxx_std_17)
+        target_compile_definitions(xqc_video_receiver PRIVATE XQC_HAVE_FFMPEG=1)
+        target_link_libraries(xqc_video_receiver PRIVATE ${APP_DEPEND_LIBS} ${XQC_FFMPEG_LIBS} OpenGL::GL)
+        if(XQC_ENABLE_HW_DECODE)
+            target_compile_definitions(xqc_video_receiver PRIVATE XQC_HAVE_HW_DECODE=1)
+            target_link_libraries(xqc_video_receiver PRIVATE PkgConfig::EGL PkgConfig::LIBVA PkgConfig::DRM)
+            if(CUDAToolkit_FOUND)
+                target_compile_definitions(xqc_video_receiver PRIVATE XQC_HAVE_CUDA_GL=1)
+                target_link_libraries(xqc_video_receiver PRIVATE CUDA::cudart)
+            else()
+                message(WARNING "CUDAToolkit not found: CUDA NVDEC will build without GL interop (install nvidia-cuda-toolkit)")
+            endif()
+        endif()
+        if(GLFW3_FOUND)
+            target_compile_definitions(xqc_video_receiver PRIVATE XQC_HAVE_GLFW=1)
+            target_include_directories(xqc_video_receiver PRIVATE ${GLFW3_INCLUDE_DIRS})
+            target_link_libraries(xqc_video_receiver PRIVATE ${GLFW3_LIBRARIES})
+        endif()
     endif()
 
     add_executable(xqc_h264_decode_smoke lowlatency/xqc_h264_decode_smoke.cpp ${LOWLATENCY_H264_DECODE_SOURCES})

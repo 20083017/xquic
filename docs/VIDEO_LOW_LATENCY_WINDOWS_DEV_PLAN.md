@@ -78,9 +78,13 @@ FFmpeg **HEVC + NVDEC** → **NV12**（必要时 hwdownload）→ **2 PBO**（�
 
 **目标**：发送侧（可为 **FFmpeg 命令行** 或 **独立 encoder 模块**）固化 **`ffmpeg -h encoder=hevc_nvenc`** 核对后的 **4K 低延迟参数 JSON**；与接收侧 **NVDEC** 对称测试。
 
-**实现**：`docs/config/hevc_nvenc_low_latency.json` — CLI 参数模板 + Pascal 说明；**仍需**按本机 `ffmpeg -h encoder=hevc_nvenc` 逐项核对键名。
+**实现**：
+- `docs/config/hevc_nvenc_low_latency.json` — CLI 参数模板
+- `scripts/gen_hevc_annexb.sh` — NVENC / libx265 生成 Annex-B
+- **跨端操作手册**：[`CROSS_ENDPOINT_HEVC.md`](./CROSS_ENDPOINT_HEVC.md)
+- Linux/WSL 收端：`xqc_video_receiver --codec hevc --hw-decode=cuda --display` + `hevc_cuvid`
 
-**验收**：同机或双机 **RTT/丢包** 场景下记录 **E2E** 与 **卡顿主观/客观指标**；明确 **无 `av1_nvenc`** 于 1050 Ti。
+**验收**：同机或双机 **RTT/丢包** 场景下记录 **E2E** 与 **卡顿主观/客观指标**；`stream_nv12 > 0` 且 WSLg 有画面；明确 **无 `av1_nvenc`** 于 1050 Ti。
 
 ---
 

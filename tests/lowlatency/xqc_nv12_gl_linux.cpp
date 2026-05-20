@@ -13,6 +13,12 @@
 #include "xqc_video_target.hh"
 #if defined(XQC_HAVE_HW_DECODE)
 #include "xqc_gl_egl_dma.hh"
+#include "xqc_h264_hw_linux.hh"
+#include "xqc_nvidia_prime_env.hh"
+#include "xqc_thread_affinity.hh"
+#if defined(XQC_HAVE_CUDA_GL)
+#include "xqc_cuda_gl_nv12.hh"
+#endif
 #endif
 
 #define GLFW_INCLUDE_NONE
@@ -165,6 +171,7 @@ in vec2 v_uv;
 out vec4 fragColor;
 uniform sampler2D u_texY;
 uniform sampler2D u_texUV;
+uniform int u_uv_la;
 vec3 yuv709(vec3 yuv) {
     yuv = vec3(yuv.x - 16.0/255.0, yuv.y - 0.5, yuv.z - 0.5);
     mat3 m = mat3(1.16438356, 1.16438356, 1.16438356,
@@ -174,7 +181,8 @@ vec3 yuv709(vec3 yuv) {
 }
 void main() {
     float y = texture(u_texY, v_uv).r;
-    vec2 uv = texture(u_texUV, v_uv).rg;
+    vec4 uv_s = texture(u_texUV, v_uv);
+    vec2 uv = u_uv_la != 0 ? uv_s.ra : uv_s.rg;
     fragColor = vec4(yuv709(vec3(y, uv.x, uv.y)), 1.0);
 })";
 
@@ -234,21 +242,47 @@ void XqcNv12GlLinux::stop() {
 
 void XqcNv12GlLinux::submit_frame(XqcNv12Frame frame) {
     std::lock_guard<std::mutex> lk(_frame_mu);
+#if defined(XQC_HAVE_HW_DECODE)
+    if (_has_pending && _pending.backing == XqcNv12Backing::CudaGl) {
+        xqc_nv12_frame_release(_pending);
+    }
+#endif
     _pending = std::move(frame);
     _has_pending = true;
 }
 
 void XqcNv12GlLinux::thread_main() {
+#if defined(XQC_HAVE_HW_DECODE)
+    if (xqc_h264_hw_display_use_cuda_gl()) {
+        xqc_nvidia_prime_apply_for_cuda_gl();
+    }
+    int decode_cpu = -1;
+    int display_cpu = -1;
+    xqc_resolve_pipeline_cpus(decode_cpu, display_cpu);
+    (void)xqc_pin_current_thread(display_cpu, "display");
+#endif
     if (!glfwInit()) {
         std::fprintf(stderr, "[gl] glfwInit failed (DISPLAY=%s)\n", getenv("DISPLAY") ? getenv("DISPLAY") : "");
         return;
     }
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
-    glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
 #if defined(XQC_HAVE_HW_DECODE)
-    /* EGL context required for dma-buf import (VAAPI zero-copy). */
-    glfwWindowHint(GLFW_CONTEXT_CREATION_API, GLFW_EGL_CONTEXT_API);
+    /* EGL for VAAPI dma-buf; GLX + CUDA-GL interop for NVDEC (no CPU PBO on CUDA path). */
+    if (xqc_h264_hw_display_use_egl()) {
+        glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
+        glfwWindowHint(GLFW_CONTEXT_CREATION_API, GLFW_EGL_CONTEXT_API);
+        std::fprintf(stderr, "[gl] EGL context (VAAPI dma-buf display)\n");
+    } else if (xqc_h264_hw_display_use_cuda_gl()) {
+        /* Compat profile: cudaGraphicsGLRegisterImage needs legacy LUMINANCE formats on many drivers. */
+        glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_COMPAT_PROFILE);
+        std::fprintf(stderr, "[gl] GLX compat context (CUDA-GL interop, hevc_cuvid path)\n");
+    } else {
+        glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
+        std::fprintf(stderr, "[gl] GLX context (PBO upload, software NV12)\n");
+    }
+#else
+    glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
 #endif
 
     GLFWwindow* win = glfwCreateWindow(_init_w, _init_h, _title, nullptr, nullptr);
@@ -267,6 +301,11 @@ void XqcNv12GlLinux::thread_main() {
     }
 #if defined(XQC_HAVE_HW_DECODE)
     (void)xqc_gl_egl_dma_init(win);
+#if defined(XQC_HAVE_CUDA_GL)
+    if (xqc_h264_hw_display_use_cuda_gl()) {
+        (void)xqc_cuda_gl_nv12_init();
+    }
+#endif
 #endif
 
     GLuint prog = build_program();
@@ -288,9 +327,11 @@ void XqcNv12GlLinux::thread_main() {
 
     GLint locY = p_glGetUniformLocation(prog, "u_texY");
     GLint locUV = p_glGetUniformLocation(prog, "u_texUV");
+    GLint locUvLa = p_glGetUniformLocation(prog, "u_uv_la");
     p_glUseProgram(prog);
     p_glUniform1i(locY, 0);
     p_glUniform1i(locUV, 1);
+    p_glUniform1i(locUvLa, 0);
 
     GLuint texY = 0, texUV = 0;
     p_glGenTextures(1, &texY);
@@ -320,6 +361,7 @@ void XqcNv12GlLinux::thread_main() {
 
         bool drew_frame = false;
         bool drew_egl = false;
+        bool drew_cuda_gl = false;
         if (frame.width > 0 && frame.height > 0) {
             const int w = frame.width;
             const int h = frame.height;
@@ -328,6 +370,19 @@ void XqcNv12GlLinux::thread_main() {
                     w, h, XQC_VIDEO_TARGET_WIDTH, XQC_VIDEO_TARGET_HEIGHT);
             }
 #if defined(XQC_HAVE_HW_DECODE)
+#if defined(XQC_HAVE_CUDA_GL)
+            if (frame.backing == XqcNv12Backing::CudaGl) {
+                if (xqc_cuda_gl_nv12_upload_nv12(frame)) {
+                    tex_w = w;
+                    tex_h = h;
+                    drew_frame = true;
+                    drew_cuda_gl = true;
+                } else if (xqc_cuda_gl_nv12_fallback_to_cpu(frame)) {
+                    /* fall through to PBO path below */
+                }
+            }
+            if (!drew_frame)
+#endif
             if (frame.backing == XqcNv12Backing::VaapiDmaBuf && xqc_gl_egl_dma_upload_nv12(frame)) {
                 tex_w = w;
                 tex_h = h;
@@ -378,6 +433,12 @@ void XqcNv12GlLinux::thread_main() {
             }
         }
 
+#if defined(XQC_HAVE_HW_DECODE)
+        if (frame.backing == XqcNv12Backing::CudaGl) {
+            xqc_nv12_frame_release(frame);
+        }
+#endif
+
         int fbw = 0, fbh = 0;
         glfwGetFramebufferSize(win, &fbw, &fbh);
         glViewport(0, 0, fbw, fbh);
@@ -386,17 +447,28 @@ void XqcNv12GlLinux::thread_main() {
         if (tex_w > 0) {
             p_glActiveTexture(0x84C0);
 #if defined(XQC_HAVE_HW_DECODE)
+#if defined(XQC_HAVE_CUDA_GL)
+            p_glBindTexture(0x0DE1, drew_cuda_gl ? xqc_cuda_gl_nv12_tex_y()
+                : (drew_egl ? xqc_gl_egl_tex_y() : texY));
+#else
             p_glBindTexture(0x0DE1, drew_egl ? xqc_gl_egl_tex_y() : texY);
+#endif
 #else
             p_glBindTexture(0x0DE1, texY);
 #endif
             p_glActiveTexture(0x84C1);
 #if defined(XQC_HAVE_HW_DECODE)
+#if defined(XQC_HAVE_CUDA_GL)
+            p_glBindTexture(0x0DE1, drew_cuda_gl ? xqc_cuda_gl_nv12_tex_uv()
+                : (drew_egl ? xqc_gl_egl_tex_uv() : texUV));
+#else
             p_glBindTexture(0x0DE1, drew_egl ? xqc_gl_egl_tex_uv() : texUV);
+#endif
 #else
             p_glBindTexture(0x0DE1, texUV);
 #endif
             p_glUseProgram(prog);
+            p_glUniform1i(locUvLa, drew_cuda_gl && xqc_cuda_gl_nv12_uses_luminance_alpha_uv() ? 1 : 0);
             p_glBindVertexArray(vao);
             p_glDrawArrays(0x0005, 0, 4);
         }
@@ -412,6 +484,9 @@ void XqcNv12GlLinux::thread_main() {
 
     _running = false;
 #if defined(XQC_HAVE_HW_DECODE)
+#if defined(XQC_HAVE_CUDA_GL)
+    xqc_cuda_gl_nv12_shutdown();
+#endif
     xqc_gl_egl_dma_shutdown();
 #endif
     glfwDestroyWindow(win);

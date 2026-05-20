@@ -31,11 +31,17 @@ void xqc_h264_decode_push_annexb(uint16_t camera_id, const uint8_t* annexb, std:
 void xqc_h264_decode_push_annexb_ts(uint16_t camera_id, const uint8_t* annexb, std::size_t annexb_len,
     int64_t wire_pts_us, uint64_t recv_us);
 
-/** Enable NV12 queue for display (depth 4; ~48 MiB peak at 4K). */
+/** Enable NV12 queue for display (default depth 1 via XQC_NV12_QUEUE_DEPTH). */
 void xqc_h264_decode_enable_nv12_output(bool enable);
 
 /** Pop latest NV12 (display path; drops older queued frames). */
 bool xqc_h264_decode_try_pop_nv12(XqcNv12Frame& out);
+
+/** Depth of Annex-B ingress queue (reactor catch-up). */
+std::size_t xqc_h264_decode_annexb_queue_depth();
+
+/** Depth of NV12 egress queue (display bridge). */
+std::size_t xqc_h264_decode_nv12_queue_depth();
 
 /** Pop one frame FIFO (tests / drain after decode_file). */
 bool xqc_h264_decode_try_pop_nv12_fifo(XqcNv12Frame& out);

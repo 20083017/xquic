@@ -4,9 +4,15 @@
 
 **实施顺序与验收阶段**（与当前 CMake/代码差距对照）：见 **[`VIDEO_LOW_LATENCY_WINDOWS_DEV_PLAN.md`](./VIDEO_LOW_LATENCY_WINDOWS_DEV_PLAN.md)**。
 
-**主链路（接收 / 显示）**
+**主链路（接收 / 显示）— 按 GPU 二选一**
 
-`HEVC (H.265) 码流` → **FFmpeg + NVDEC（硬件解码）** → 统一 **`AV_PIX_FMT_NV12`**（必要时 `hwdownload` / `av_hwframe_transfer_data` 落到 CPU 可映射缓冲）→ **OpenGL `GL_PIXEL_UNPACK_BUFFER`（2 或 3 个 PBO，见 §5）** 异步上传 → **双纹理 NV12（R8 + RG8）+ fragment shader（BT.709 / BT.2020 SDR 可选）** → **V-Sync 全屏绘制**
+| GPU | 硬解 | 显示 |
+|-----|------|------|
+| **Intel / AMD** | VAAPI | **VAAPI + EGL + DMA-BUF**（零拷贝，最佳） |
+| **NVIDIA** | CUDA / NVDEC | **CUDA/NVDEC + GLX + PBO** |
+
+NVIDIA 路径：`HEVC` → NVDEC → NV12（`hwdownload`）→ **PBO（§5）** → 双纹理 NV12 + shader → V-Sync 全屏。
+Intel/AMD 路径：`HEVC` → VAAPI → **dma-buf → EGLImage** → 纹理合成（见 Linux `xqc_gl_egl_dma.cpp`）。
 
 **编码侧（发送，与上链对称但方向相反）**：**`hevc_nvenc`**（同机 4K 低延迟参数集）；**无 `av1_nvenc`**（Pascal / 1050 Ti）。
 
@@ -25,7 +31,7 @@
 ```mermaid
 flowchart LR
   subgraph Send["发送侧"]
-    A["摄像机 / 文件\n(H.264 / HEVC Annex-B)"]
+    A["摄像机 / 文件\n(HEVC / H.264 Annex-B)"]
     B["NAL 切分 + 帧头\nxqc_video_frame_header_t"]
     C["QUIC transport 流\nALPN: transport"]
     A --> B --> C
@@ -37,7 +43,7 @@ flowchart LR
   subgraph Recv["接收侧（示例：Seastar 或 libevent）"]
     R1["xqc_stream_recv\n累积 recv_body"]
     R2["按 16B 头解析\n完整 NAL payload"]
-    R3["Annex-B 写盘\n*.h264（可选）"]
+    R3["Annex-B 写盘\n*.h265 / *.h264（可选）"]
     R4["XqcBoundedFrameQueue\npush_drop_oldest"]
     N --> R1 --> R2 --> R3
     R2 --> R4
@@ -59,7 +65,7 @@ flowchart LR
 
 - **reactor / `on_stream_read_notify`**：只做 **收字节、解析 wire、入队**；**禁止**在此路径内长时间 `avcodec_receive_frame` / `glMapBufferRange`。
 - **两条抖动吸收带**：**解码前** 有界队列（§1）丢弃最旧、保最新；**解码后** PBO 环（§5）吸收「上传 vs V-Sync」错位。
-- **当前仓库增量**：`xquic_server_seastar --video --video-decode` 将 Annex-B 切片送入 **单解码线程**；`video_client --decode-preview` 在发送侧 **镜像** 同一路径做本机验证（非对端回环）。
+- **当前仓库增量**：`xqc_video_receiver --codec hevc --hw-decode=cuda --display`（Linux/WSL 跨端收流 + NVDEC + GL）；`video_client --cam0 clip.h265 --codec hevc` 发送。操作见 **[`CROSS_ENDPOINT_HEVC.md`](./CROSS_ENDPOINT_HEVC.md)**。
 
 ### 0.2 分层架构图（职责边界）
 

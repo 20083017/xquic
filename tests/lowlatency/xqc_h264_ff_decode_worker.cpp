@@ -4,7 +4,7 @@
  *
  * ## Thread model
  * - **libevent / Seastar reactor**: parses QUIC video wire, calls `xqc_h264_decode_push_annexb_ts`.
- * - **DecodeWorker thread** (this file): bounded queue of Annex-B slices → NV12 → `g_nv12_queue`.
+ * - **DecodeWorker thread** (this file): SPSC Annex-B ring → NV12 → lock-free NV12 SPSC ring.
  * - **Display thread** (`xqc_nv12_gl_linux.cpp`): pops NV12, uploads to GPU, presents.
  *
  * ## GPU vs CPU on Linux/WSL (current default)
@@ -31,10 +31,13 @@
 #include "xqc_e2e_latency.hh"
 #include "xqc_h264_decode_stats.hh"
 #include "xqc_h264_hw_linux.hh"
-#include "xqc_bounded_frame_queue.hh"
+#include "xqc_spsc_frame_queue.hh"
+#include "xqc_thread_affinity.hh"
 #include "xqc_video_codec.hh"
+#include "xqc_video_low_latency.hh"
 
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <map>
@@ -43,6 +46,9 @@
 #include <sys/time.h>
 #include <thread>
 #include <vector>
+
+static constexpr std::size_t kAnnexbRingCapacity = 64;
+static constexpr std::size_t kNv12RingCapacity = 8;
 
 #if defined(XQC_HAVE_FFMPEG)
 
@@ -55,6 +61,7 @@ void xqc_nv12_frame_release(XqcNv12Frame& f) {
 #endif
 
 static XqcH264DecodeStats g_stats;
+static XqcSpscQueueStats g_spsc_stats;
 static XqcVideoCodec g_default_codec = XqcVideoCodec::HEVC;
 static std::map<uint16_t, XqcVideoCodec> g_camera_codecs;
 static std::mutex g_codec_mu;
@@ -158,9 +165,44 @@ struct Slice {
     uint64_t recv_us = 0;
 };
 
-std::mutex g_nv12_mu;
-std::unique_ptr<XqcBoundedFrameQueue<XqcNv12Frame>> g_nv12_queue;
+XqcSpscFrameQueue<XqcNv12Frame, kNv12RingCapacity> g_nv12_ring;
 std::atomic<bool> g_nv12_out{false};
+std::thread::id g_nv12_producer_tid{};
+
+void nv12_frame_release_fn(XqcNv12Frame& f) {
+    xqc_nv12_frame_release(f);
+}
+
+void nv12_push_drop_oldest(XqcNv12Frame&& nv12) {
+    if (!g_nv12_out.load(std::memory_order_acquire)) {
+        nv12_frame_release_fn(nv12);
+        return;
+    }
+    const std::size_t max_depth = xqc_video_nv12_queue_depth();
+    while (g_nv12_ring.size() >= max_depth) {
+        XqcNv12Frame old;
+        if (!g_nv12_ring.try_pop(old)) {
+            break;
+        }
+        g_spsc_stats.nv12_drop_depth.fetch_add(1, std::memory_order_relaxed);
+        nv12_frame_release_fn(old);
+    }
+    const bool ring_full = g_nv12_ring.size() >= g_nv12_ring.usable_capacity();
+    if (!g_nv12_ring.push_drop_oldest(std::move(nv12), nv12_frame_release_fn)) {
+        g_spsc_stats.nv12_drop_ring.fetch_add(1, std::memory_order_relaxed);
+        nv12_frame_release_fn(nv12);
+    } else {
+        g_spsc_stats.nv12_push.fetch_add(1, std::memory_order_relaxed);
+        if (ring_full) {
+            g_spsc_stats.nv12_drop_ring.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+}
+
+bool nv12_push_allowed_from_this_thread() {
+    const auto producer = g_nv12_producer_tid;
+    return producer == std::thread::id{} || std::this_thread::get_id() == producer;
+}
 
 class DecodeWorker;
 
@@ -202,24 +244,21 @@ private:
 
 class DecodeWorker {
 public:
-    DecodeWorker() : queue_(std::make_unique<XqcBoundedFrameQueue<Slice>>(64, nullptr)) {}
+    DecodeWorker() = default;
 
     void start() {
         if (thread_.joinable()) {
             return;
         }
-        stop_ = false;
-        queue_ = std::make_unique<XqcBoundedFrameQueue<Slice>>(64, nullptr);
+        stop_.store(false, std::memory_order_release);
+        annexb_ring_.reset();
         frames_out_ = 0;
         thread_ = std::thread([this] { run(); });
     }
 
     void stop() {
-        stop_ = true;
+        stop_.store(true, std::memory_order_release);
         request_flush(0);
-        if (queue_) {
-            queue_->close();
-        }
         if (thread_.joinable()) {
             thread_.join();
         }
@@ -229,7 +268,7 @@ public:
     void push_ts(uint16_t camera_id, const uint8_t* p, std::size_t n,
         int64_t wire_pts_us, uint64_t recv_us)
     {
-        if (stop_.load() || n == 0 || !queue_ || queue_->closed()) {
+        if (stop_.load(std::memory_order_acquire) || n == 0) {
             return;
         }
         g_stats.annexb_pushed.fetch_add(1);
@@ -238,17 +277,23 @@ public:
         s.wire_pts_us = wire_pts_us;
         s.recv_us = recv_us;
         s.annexb.assign(p, p + n);
-        queue_->push_drop_oldest(std::move(s));
+        const bool annexb_full = annexb_ring_.size() >= annexb_ring_.usable_capacity();
+        annexb_ring_.push_drop_oldest(std::move(s));
+        g_spsc_stats.annexb_push.fetch_add(1, std::memory_order_relaxed);
+        if (annexb_full) {
+            g_spsc_stats.annexb_drop_oldest.fetch_add(1, std::memory_order_relaxed);
+        }
     }
 
     void request_flush(uint16_t camera_id = 0) {
-        if (stop_.load() || !queue_ || queue_->closed()) {
-            return;
-        }
         Slice s;
         s.camera_id = camera_id;
         s.flush = true;
-        queue_->push_drop_oldest(std::move(s));
+        annexb_ring_.push_drop_oldest(std::move(s));
+    }
+
+    std::size_t annexb_queue_depth() const {
+        return annexb_ring_.size();
     }
 
     void emit_nv12(const AVFrame* frame, uint16_t camera_id,
@@ -259,7 +304,7 @@ private:
 
     void run();
 
-    std::unique_ptr<XqcBoundedFrameQueue<Slice>> queue_;
+    XqcSpscFrameQueue<Slice, kAnnexbRingCapacity> annexb_ring_;
     std::thread thread_;
     std::atomic<bool> stop_{false};
     uint64_t frames_out_ = 0;
@@ -288,10 +333,7 @@ void DecodeWorker::emit_nv12(const AVFrame* frame, uint16_t camera_id,
     nv12.from_stream = !from_file;
     xqc_h264_decode_stats_note_nv12(recv_us, decode_us, wire_pts_us, from_file);
 
-    std::lock_guard<std::mutex> lk(g_nv12_mu);
-    if (g_nv12_queue && g_nv12_out.load()) {
-        g_nv12_queue->push_drop_oldest(std::move(nv12));
-    }
+    nv12_push_drop_oldest(std::move(nv12));
     if ((frames_out_ & 63u) == 0u) {
         std::fprintf(stderr, "[decode] camera=%u frames=%llu %dx%d\n",
             static_cast<unsigned>(camera_id),
@@ -474,46 +516,60 @@ void CamDecoder::flush(uint16_t camera_id) {
 }
 
 void DecodeWorker::run() {
+    int decode_cpu = -1;
+    int display_cpu = -1;
+    xqc_resolve_pipeline_cpus(decode_cpu, display_cpu);
+    (void)xqc_pin_current_thread(decode_cpu, "decode");
+
     av_log_set_level(AV_LOG_FATAL);
-    std::fprintf(stderr, "[decode] stream worker started default_codec=%s backend=%s (FFmpeg %d.x)\n",
+    g_nv12_producer_tid = std::this_thread::get_id();
+    std::fprintf(stderr,
+        "[decode] stream worker started default_codec=%s backend=%s SPSC annexb=%zu nv12=%zu lock-free=1 (FFmpeg %d.x)\n",
         xqc_video_codec_name(g_default_codec),
 #if defined(XQC_HAVE_HW_DECODE)
         xqc_h264_hw_backend_name(),
 #else
         "software",
 #endif
+        kAnnexbRingCapacity - 1,
+        kNv12RingCapacity - 1,
         LIBAVCODEC_VERSION_MAJOR);
 
-    while (!stop_.load()) {
-        std::unique_lock<std::mutex> lk(queue_->mutex());
-        Slice slice;
-        if (!queue_->wait_pop(slice, lk)) {
-            if (queue_->closed()) {
-                break;
-            }
-            continue;
-        }
-        lk.unlock();
-
+    auto process_slice = [this](Slice& slice) {
+        g_spsc_stats.annexb_pop.fetch_add(1, std::memory_order_relaxed);
         CamDecoder& dec = decoder_for(slice.camera_id);
         if (!dec.ensure_open()) {
             std::fprintf(stderr, "[decode] camera %u open failed\n", slice.camera_id);
-            continue;
+            return;
         }
-
         if (slice.flush) {
             dec.flush(slice.camera_id);
-            continue;
+            return;
         }
-
         dec.feed(slice.annexb.data(), slice.annexb.size(), slice.camera_id,
             slice.wire_pts_us, slice.recv_us);
+    };
+
+    while (true) {
+        Slice slice;
+        if (annexb_ring_.try_pop(slice)) {
+            process_slice(slice);
+            continue;
+        }
+        if (stop_.load(std::memory_order_acquire)) {
+            while (annexb_ring_.try_pop(slice)) {
+                process_slice(slice);
+            }
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::microseconds(200));
     }
 
     for (auto& kv : decoders_) {
         kv.second->flush(kv.first);
     }
     decoders_.clear();
+    g_nv12_producer_tid = std::thread::id{};
     std::fprintf(stderr, "[decode] exit frames=%llu stream=%llu file=%llu\n",
         static_cast<unsigned long long>(frames_out_),
         static_cast<unsigned long long>(g_stats.stream_frames.load()),
@@ -582,9 +638,8 @@ void decode_file_impl(const char* path, uint16_t camera_id) {
                 nv12.decode_us = decode_us;
                 nv12.from_stream = false;
                 xqc_h264_decode_stats_note_nv12(recv_us, decode_us, 0, true);
-                std::lock_guard<std::mutex> lk(g_nv12_mu);
-                if (g_nv12_queue && g_nv12_out.load()) {
-                    g_nv12_queue->push_drop_oldest(std::move(nv12));
+                if (nv12_push_allowed_from_this_thread()) {
+                    nv12_push_drop_oldest(std::move(nv12));
                 }
             }
             av_frame_unref(frame);
@@ -600,9 +655,8 @@ void decode_file_impl(const char* path, uint16_t camera_id) {
             nv12.decode_us = decode_us;
             nv12.from_stream = false;
             xqc_h264_decode_stats_note_nv12(recv_us, decode_us, 0, true);
-            std::lock_guard<std::mutex> lk(g_nv12_mu);
-            if (g_nv12_queue && g_nv12_out.load()) {
-                g_nv12_queue->push_drop_oldest(std::move(nv12));
+            if (nv12_push_allowed_from_this_thread()) {
+                nv12_push_drop_oldest(std::move(nv12));
             }
         }
         av_frame_unref(frame);
@@ -637,10 +691,47 @@ void xqc_h264_decode_stats_reset() {
     g_stats.latency_count.store(0);
     g_stats.last_wire_pts_us.store(0);
     g_stats.last_decode_us.store(0);
+    g_spsc_stats.annexb_push.store(0);
+    g_spsc_stats.annexb_pop.store(0);
+    g_spsc_stats.annexb_drop_oldest.store(0);
+    g_spsc_stats.nv12_push.store(0);
+    g_spsc_stats.nv12_drop_depth.store(0);
+    g_spsc_stats.nv12_drop_ring.store(0);
+    g_spsc_stats.nv12_display_pop.store(0);
+    g_spsc_stats.nv12_skipped_latest.store(0);
+    g_spsc_stats.display_submit.store(0);
 }
 
 XqcH264DecodeStats* xqc_h264_decode_stats() {
     return &g_stats;
+}
+
+XqcSpscQueueStats* xqc_spsc_queue_stats() {
+    return &g_spsc_stats;
+}
+
+void xqc_h264_decode_log_spsc_stats() {
+    const std::size_t annexb_depth = xqc_h264_decode_annexb_queue_depth();
+    const std::size_t nv12_depth = xqc_h264_decode_nv12_queue_depth();
+    std::fprintf(stderr,
+        "[spsc] annexb push=%llu pop=%llu drop=%llu depth=%zu/%zu"
+        " | nv12 push=%llu pop=%llu skip=%llu drop_depth=%llu drop_ring=%llu depth=%zu/%zu"
+        " | display_submit=%llu lock_free=1\n",
+        static_cast<unsigned long long>(g_spsc_stats.annexb_push.load()),
+        static_cast<unsigned long long>(g_spsc_stats.annexb_pop.load()),
+        static_cast<unsigned long long>(g_spsc_stats.annexb_drop_oldest.load()),
+        annexb_depth, kAnnexbRingCapacity - 1,
+        static_cast<unsigned long long>(g_spsc_stats.nv12_push.load()),
+        static_cast<unsigned long long>(g_spsc_stats.nv12_display_pop.load()),
+        static_cast<unsigned long long>(g_spsc_stats.nv12_skipped_latest.load()),
+        static_cast<unsigned long long>(g_spsc_stats.nv12_drop_depth.load()),
+        static_cast<unsigned long long>(g_spsc_stats.nv12_drop_ring.load()),
+        nv12_depth, kNv12RingCapacity - 1,
+        static_cast<unsigned long long>(g_spsc_stats.display_submit.load()));
+}
+
+void xqc_h264_decode_note_display_submit() {
+    g_spsc_stats.display_submit.fetch_add(1, std::memory_order_relaxed);
 }
 
 void xqc_h264_decode_stats_note_nv12(uint64_t recv_us, uint64_t decode_us,
@@ -663,32 +754,54 @@ void xqc_h264_decode_stats_note_nv12(uint64_t recv_us, uint64_t decode_us,
 }
 
 void xqc_h264_decode_enable_nv12_output(bool enable) {
-    g_nv12_out = enable;
-    std::lock_guard<std::mutex> lk(g_nv12_mu);
-    if (enable && !g_nv12_queue) {
-        g_nv12_queue = std::make_unique<XqcBoundedFrameQueue<XqcNv12Frame>>(4,
-            [](XqcNv12Frame& f) { xqc_nv12_frame_release(f); });
+    g_nv12_out.store(enable, std::memory_order_release);
+    if (enable) {
+        std::fprintf(stderr,
+            "[spsc] NV12 ring enabled cap=%zu max_depth=%zu (lock-free SPSC, display bridge consumer)\n",
+            kNv12RingCapacity - 1, xqc_video_nv12_queue_depth());
+    } else {
+        XqcNv12Frame dropped;
+        while (g_nv12_ring.try_pop(dropped)) {
+            nv12_frame_release_fn(dropped);
+        }
+        g_nv12_ring.reset();
     }
-    if (!enable && g_nv12_queue) {
-        g_nv12_queue->close();
-        g_nv12_queue.reset();
+}
+
+std::size_t xqc_h264_decode_annexb_queue_depth() {
+    std::lock_guard<std::mutex> lk(g_mu);
+    if (!g_worker) {
+        return 0;
     }
+    return g_worker->annexb_queue_depth();
+}
+
+std::size_t xqc_h264_decode_nv12_queue_depth() {
+    return g_nv12_ring.size();
 }
 
 bool xqc_h264_decode_try_pop_nv12(XqcNv12Frame& out) {
-    std::lock_guard<std::mutex> lk(g_nv12_mu);
-    if (!g_nv12_queue) {
+    if (!g_nv12_out.load(std::memory_order_acquire)) {
         return false;
     }
-    return g_nv12_queue->try_pop_latest(out);
+    if (!g_nv12_ring.try_pop(out)) {
+        return false;
+    }
+    g_spsc_stats.nv12_display_pop.fetch_add(1, std::memory_order_relaxed);
+    XqcNv12Frame newer;
+    while (g_nv12_ring.try_pop(newer)) {
+        g_spsc_stats.nv12_skipped_latest.fetch_add(1, std::memory_order_relaxed);
+        nv12_frame_release_fn(out);
+        out = std::move(newer);
+    }
+    return true;
 }
 
 bool xqc_h264_decode_try_pop_nv12_fifo(XqcNv12Frame& out) {
-    std::lock_guard<std::mutex> lk(g_nv12_mu);
-    if (!g_nv12_queue) {
+    if (!g_nv12_out.load(std::memory_order_acquire)) {
         return false;
     }
-    return g_nv12_queue->try_pop(out);
+    return g_nv12_ring.try_pop(out);
 }
 
 void xqc_h264_decode_configure_hw(const char* mode) {
@@ -727,6 +840,9 @@ void xqc_h264_decode_worker_start() {
         g_worker = std::make_unique<DecodeWorker>();
     }
     g_worker->start();
+    std::fprintf(stderr,
+        "[spsc] decode worker up: Annex-B ring producer=reactor consumer=decode-thread (cap=%zu)\n",
+        kAnnexbRingCapacity - 1);
 }
 
 void xqc_h264_decode_worker_stop() {
@@ -773,6 +889,9 @@ void xqc_h264_decode_file(const char* path, uint16_t camera_id) {
 
 void xqc_h264_decode_stats_reset() {}
 XqcH264DecodeStats* xqc_h264_decode_stats() { return nullptr; }
+XqcSpscQueueStats* xqc_spsc_queue_stats() { return nullptr; }
+void xqc_h264_decode_log_spsc_stats() {}
+void xqc_h264_decode_note_display_submit() {}
 void xqc_h264_decode_stats_note_nv12(uint64_t, uint64_t, int64_t, bool) {}
 
 void xqc_h264_decode_enable_nv12_output(bool) {}

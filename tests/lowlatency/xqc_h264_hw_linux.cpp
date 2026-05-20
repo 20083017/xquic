@@ -17,6 +17,7 @@ extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavutil/hwcontext.h>
 #include <libavutil/hwcontext_vaapi.h>
+#include <libavutil/opt.h>
 #include <libavutil/pixdesc.h>
 }
 
@@ -82,7 +83,7 @@ bool try_cuda() {
     }
     g_hw_device = dev;
     g_active = XqcHwDecodeBackend::Cuda;
-    std::fprintf(stderr, "[hw] CUDA/NVDEC ready h264=%s hevc=%s (NV12 via hwdownload → PBO)\n",
+    std::fprintf(stderr, "[hw] CUDA/NVDEC ready h264=%s hevc=%s (NV12 CUDA-GL interop, no hwdownload)\n",
         h264 ? "yes" : "no", hevc ? "yes" : "no");
     return true;
 }
@@ -155,22 +156,37 @@ bool vaapi_export_dmabuf(AVFrame* frame, XqcNv12Frame& out, uint16_t camera_id) 
     return true;
 }
 
-bool cuda_to_cpu_nv12(AVFrame* frame, XqcNv12Frame& out, uint16_t camera_id) {
-    AVFrame* sw = av_frame_alloc();
-    if (!sw) {
+bool cuda_to_gl_nv12(AVFrame* frame, XqcNv12Frame& out, uint16_t camera_id) {
+    if (!frame || frame->format != AV_PIX_FMT_CUDA) {
         return false;
     }
-    const int err = av_hwframe_transfer_data(sw, frame, 0);
-    if (err < 0) {
-        av_frame_free(&sw);
+    AVFrame* held = av_frame_alloc();
+    if (!held) {
         return false;
     }
-    const bool ok = xqc_frame_to_nv12_cpu(sw, camera_id, out);
-    av_frame_free(&sw);
-    if (ok) {
-        out.backing = XqcNv12Backing::Cpu;
+    if (av_frame_ref(held, frame) < 0) {
+        av_frame_free(&held);
+        return false;
     }
-    return ok;
+    out.camera_id = camera_id;
+    out.width = frame->width;
+    out.height = frame->height;
+    out.backing = XqcNv12Backing::CudaGl;
+    out.data.clear();
+    out.cuda_frame = held;
+    return true;
+}
+
+bool prefer_cuda_first_for_auto() {
+#if defined(__linux__)
+    const char* wsl = getenv("WSL_DISTRO_NAME");
+    if (!wsl || !wsl[0]) {
+        return false;
+    }
+    return access("/dev/nvidia0", F_OK) == 0 || access("/dev/dxg", F_OK) == 0;
+#else
+    return false;
+#endif
 }
 
 } // namespace
@@ -196,11 +212,20 @@ XqcHwDecodeBackend xqc_h264_hw_init() {
         return g_active;
     }
 
-    if ((g_requested == XqcHwDecodeBackend::Auto || g_requested == XqcHwDecodeBackend::Vaapi) && try_vaapi()) {
-        return g_active;
-    }
-    if ((g_requested == XqcHwDecodeBackend::Auto || g_requested == XqcHwDecodeBackend::Cuda) && try_cuda()) {
-        return g_active;
+    if (g_requested == XqcHwDecodeBackend::Auto && prefer_cuda_first_for_auto()) {
+        if (try_cuda()) {
+            return g_active;
+        }
+        if (try_vaapi()) {
+            return g_active;
+        }
+    } else {
+        if ((g_requested == XqcHwDecodeBackend::Auto || g_requested == XqcHwDecodeBackend::Vaapi) && try_vaapi()) {
+            return g_active;
+        }
+        if ((g_requested == XqcHwDecodeBackend::Auto || g_requested == XqcHwDecodeBackend::Cuda) && try_cuda()) {
+            return g_active;
+        }
     }
     if (g_requested != XqcHwDecodeBackend::Off && g_requested != XqcHwDecodeBackend::Auto) {
         std::fprintf(stderr, "[hw] requested backend unavailable, falling back to software\n");
@@ -213,12 +238,30 @@ XqcHwDecodeBackend xqc_h264_hw_active_backend() {
     return g_active;
 }
 
+bool xqc_h264_hw_display_use_egl() {
+    return g_active == XqcHwDecodeBackend::Vaapi
+        || g_requested == XqcHwDecodeBackend::Vaapi;
+}
+
+bool xqc_h264_hw_display_use_cuda_gl() {
+#if defined(XQC_HAVE_CUDA_GL)
+    return g_active == XqcHwDecodeBackend::Cuda
+        || g_requested == XqcHwDecodeBackend::Cuda;
+#else
+    return false;
+#endif
+}
+
 const char* xqc_h264_hw_backend_name() {
     switch (g_active) {
     case XqcHwDecodeBackend::Vaapi:
         return "vaapi+egl";
     case XqcHwDecodeBackend::Cuda:
+#if defined(XQC_HAVE_CUDA_GL)
+        return "cuda+gl";
+#else
         return "cuda+pbo";
+#endif
     case XqcHwDecodeBackend::Software:
         return "software";
     default:
@@ -255,7 +298,14 @@ bool xqc_h264_hw_open_decoder(AVCodecContext* ctx, const AVCodec*& out_codec, Xq
         }
         ctx->hw_device_ctx = av_buffer_ref(g_hw_device);
         ctx->thread_count = 1;
-        return avcodec_open2(ctx, out_codec, nullptr) >= 0;
+        ctx->max_b_frames = 0;
+        ctx->flags |= AV_CODEC_FLAG_LOW_DELAY;
+        ctx->extra_hw_frames = 0;
+        if (avcodec_open2(ctx, out_codec, nullptr) < 0) {
+            return false;
+        }
+        std::fprintf(stderr, "[hw] cuvid low-delay: max_b_frames=0 LOW_DELAY extra_hw_frames=0\n");
+        return true;
     }
     out_codec = avcodec_find_decoder(xqc_video_codec_av_id(codec));
     if (!out_codec) {
@@ -275,7 +325,12 @@ bool xqc_h264_hw_frame_to_output(AVFrame* frame, XqcNv12Frame& out, uint16_t cam
         return vaapi_export_dmabuf(frame, out, camera_id);
     }
     if (g_active == XqcHwDecodeBackend::Cuda && frame->format == AV_PIX_FMT_CUDA) {
-        return cuda_to_cpu_nv12(frame, out, camera_id);
+#if defined(XQC_HAVE_CUDA_GL)
+        return cuda_to_gl_nv12(frame, out, camera_id);
+#else
+        std::fprintf(stderr, "[hw] CUDA frame without XQC_HAVE_CUDA_GL — build with CUDAToolkit\n");
+        return false;
+#endif
     }
     if (frame->format == AV_PIX_FMT_NV12 || frame->format == AV_PIX_FMT_YUV420P) {
         return xqc_frame_to_nv12_cpu(frame, camera_id, out);
@@ -284,6 +339,10 @@ bool xqc_h264_hw_frame_to_output(AVFrame* frame, XqcNv12Frame& out, uint16_t cam
 }
 
 void xqc_nv12_frame_release(XqcNv12Frame& f) {
+    if (f.backing == XqcNv12Backing::CudaGl && f.cuda_frame) {
+        av_frame_free(reinterpret_cast<AVFrame**>(&f.cuda_frame));
+        f.cuda_frame = nullptr;
+    }
     if (f.dma_fd >= 0) {
         close(f.dma_fd);
         f.dma_fd = -1;
@@ -296,6 +355,8 @@ void xqc_nv12_frame_release(XqcNv12Frame& f) {
 void xqc_h264_hw_configure(const char*) {}
 XqcHwDecodeBackend xqc_h264_hw_init() { return XqcHwDecodeBackend::Software; }
 XqcHwDecodeBackend xqc_h264_hw_active_backend() { return XqcHwDecodeBackend::Software; }
+bool xqc_h264_hw_display_use_egl() { return false; }
+bool xqc_h264_hw_display_use_cuda_gl() { return false; }
 const char* xqc_h264_hw_backend_name() { return "software"; }
 bool xqc_h264_hw_open_decoder(AVCodecContext*, const AVCodec*&, XqcVideoCodec) { return false; }
 bool xqc_h264_hw_frame_to_output(AVFrame*, XqcNv12Frame&, uint16_t) { return false; }

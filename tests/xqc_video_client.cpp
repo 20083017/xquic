@@ -28,6 +28,7 @@
 #include <getopt.h>
 
 #include "lowlatency/xqc_h264_ff_decode_api.hh"
+#include "lowlatency/xqc_video_low_latency.hh"
 
 /* ─── Helpers ──────────────────────────────────────────────────── */
 
@@ -533,9 +534,7 @@ user_conn_t* XqcVideoClient::create_connection() {
     u_conn->ev_socket = event_new(event_base_, u_conn->fd, EV_READ | EV_PERSIST, vc_socket_cb, u_conn);
     event_add(u_conn->ev_socket, NULL);
 
-    xqc_conn_settings_t conn_settings;
-    memset(&conn_settings, 0, sizeof(conn_settings));
-    conn_settings.proto_version = XQC_VERSION_V1;
+    xqc_conn_settings_t conn_settings = xqc_video_conn_settings();
 
     xqc_conn_ssl_config_t ssl_config;
     memset(&ssl_config, 0, sizeof(ssl_config));

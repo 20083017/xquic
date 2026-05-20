@@ -207,26 +207,30 @@ build_wsl/xquic_tests/xqc_h264_decode_smoke build_wsl/test_cam0.h264
 
 若报 `Unknown encoder libx265` / `libx264`，安装 `libx265-dev` / `libx264-dev` 后重编 FFmpeg。
 
-### 5.2 一键 E2E（本地 QUIC）
+### 5.2 本地 E2E（CUDA / VAAPI 拆分）
+
+**测试矩阵全文**：[`WSL_HW_DECODE_TEST_MATRIX.md`](WSL_HW_DECODE_TEST_MATRIX.md)
+
+| 后端 | 脚本 | 输出目录 |
+|------|------|----------|
+| **CUDA / NVDEC**（NVIDIA WSL，你已验证） | `bash scripts/wsl_video_e2e_cuda.sh` | `build_wsl/video_out_cuda/` |
+| **VAAPI + EGL**（Intel/AMD） | `bash scripts/wsl_video_e2e_vaapi.sh` | `build_wsl/video_out_vaapi/` |
+| 默认（等同 CUDA） | `bash scripts/wsl_video_e2e.sh` | `build_wsl/video_out_cuda/` |
 
 ```bash
 export PKG_CONFIG_PATH="$HOME/ffmpeg-hw/lib/pkgconfig:$PKG_CONFIG_PATH"
 export LD_LIBRARY_PATH="$HOME/ffmpeg-hw/lib:${LD_LIBRARY_PATH:-}"
-export DISPLAY=:0    # WSLg 图形；无 GUI 可省略，脚本不加 --display
+export DISPLAY=:0
+export EOS_FLAGS="--no-eos-file-decode"   # 纯流内延迟
 
-# 使用自编译 ffmpeg 生成测试流（若系统 ffmpeg 过旧）
-export PATH="$HOME/ffmpeg-hw/bin:$PATH"
+# NVIDIA WSL — 推荐
+bash scripts/wsl_video_e2e_cuda.sh
 
-# 可选：打开硬解 + 流内 E2E 直方图
-export HW_DECODE=ON
-export EOS_FLAGS="--no-eos-file-decode"   # 纯流内延迟，不做 EOS 文件二次解码
-
-bash scripts/wsl_video_e2e.sh
+# Intel/AMD 核显/独显 — 另机或另环境
+# bash scripts/wsl_video_e2e_vaapi.sh
 ```
 
-脚本会：cmake → 构建 → 起 `xqc_video_receiver --codec hevc` → `video_client` 发送 → 检查 `build_wsl/video_out/cam_0.h265`。
-
-H.264 E2E：`CODEC=h264 bash scripts/wsl_video_e2e.sh`
+H.264 双栈：`CODEC=h264 HW_BACKEND=cuda bash scripts/wsl_video_e2e_cuda.sh`
 
 ### 5.3 手动分步（便于看日志）
 
@@ -236,17 +240,16 @@ H.264 E2E：`CODEC=h264 bash scripts/wsl_video_e2e.sh`
 cd /mnt/e/ros2/xquic
 export LD_LIBRARY_PATH="$HOME/ffmpeg-hw/lib:${LD_LIBRARY_PATH:-}"
 export DISPLAY=:0
-export XQC_VA_DEVICE=/dev/dri/renderD128    # VAAPI 设备，按 ls /dev/dri/ 调整
-export XQC_HW_DECODE=auto                   # auto | vaapi | cuda | off
+export XQC_HW_DECODE=cuda                     # NVIDIA WSL：固定 cuda，勿用 auto
 
 build_wsl/xquic_tests/xqc_video_receiver \
   -p 8443 \
   -c tests/server.crt \
   -k tests/server.key \
-  --video-dir ./build_wsl/video_out \
+  --video-dir ./build_wsl/video_out_cuda \
   --decode \
   --display \
-  --hw-decode=auto \
+  --hw-decode=cuda \
   --codec hevc \
   --no-eos-file-decode
 ```
@@ -288,32 +291,48 @@ build_wsl/xquic_tests/video_client \
 
 含义见 `tests/lowlatency/xqc_e2e_latency.hh`。
 
-### 5.5 远端 4K 压测（另一台电脑发流）
+### 5.5 跨端 4K HEVC（Windows 发 → WSL/Linux 收 + 显示）
 
-**接收端（WSL 本机）** — 同 5.3，监听 `0.0.0.0:8443`，Windows 防火墙需放行 UDP 8443；发送端填 WSL 可达 IP（常为 Windows 局域网 IP + 端口转发，或 WSL 镜像网络 IP）。
+**本地 CUDA 通过后即可做跨端**。完整步骤、发端/收端分终端命令、验收清单见 **[`CROSS_ENDPOINT_HEVC.md`](CROSS_ENDPOINT_HEVC.md)**。
 
-**发送端（另一台机器）**
+收端（NVIDIA）固定 **CUDA**，与本地一致：
 
 ```bash
-# 生成 4K H.264 Annex-B（约 30fps，60s）
-ffmpeg -y -f lavfi -i testsrc=size=3840x2160:rate=30 -t 60 \
-  -c:v libx264 -preset ultrafast -profile:v high -pix_fmt yuv420p -g 30 -an \
-  -f h264 cam4k.h264
-
-./video_client -a <RECEIVER_IP> -p 8443 --cam0 cam4k.h264 --fps 30
+export XQC_HW_DECODE=cuda
+./build_wsl/xquic_tests/xqc_video_receiver ... --hw-decode=cuda --codec hevc --display
 ```
+
+**发送端（Windows / 带 NVENC）**
+
+```bash
+WIDTH=3840 HEIGHT=2160 FPS=30 DURATION=60 bash scripts/gen_hevc_annexb.sh cam4k.h265
+./build_wsl/xquic_tests/video_client -a <RECEIVER_IP> -p 8443 \
+  --cam0 cam4k.h265 --codec hevc --fps 30
+```
+
+**接收端（WSL）** — `DISPLAY=:0`、`--codec hevc`、`--hw-decode=cuda`、`--display`（同 §5.3）。
 
 显示窗口按 **3840×2160** 预配（`xqc_video_target.hh`）；码流可小于 4K，会缩放绘制。
 
 ---
 
-## 6. 硬解后端对照
+## 6. 硬解后端对照（HEVC 默认 + H.264 双栈）
 
-| 模式 | FFmpeg 解码器 | 显示路径 | 启用 |
-|------|----------------|----------|------|
-| VAAPI + EGL | `h264_vaapi` | dma-buf → EGLImage | `--hw-decode=vaapi` 或 `auto` |
-| CUDA | `h264_cuvid` | 硬解后 CPU NV12 → PBO | `--hw-decode=cuda` 或 `auto` |
-| 软件 | `h264` (sw) | PBO | 不加 `--hw-decode` 或 `off` |
+**硬件 → 显示（固定搭配）**
+
+| GPU | 硬解 | 显示（推荐） |
+|-----|------|--------------|
+| **Intel / AMD** | VAAPI | **VAAPI + EGL + DMA-BUF**（零拷贝，最佳） |
+| **NVIDIA** | CUDA / NVDEC | **CUDA/NVDEC + GLX + PBO** |
+
+| 模式 | FFmpeg (HEVC) | 显示 | 启用 |
+|------|---------------|------|------|
+| NVIDIA | `hevc_cuvid` | **GLX + PBO** | `--hw-decode=cuda` |
+| Intel/AMD | `hevc_vaapi` | **EGL + DMA-BUF** | `--hw-decode=vaapi` |
+| 软件 | `hevc` sw | PBO | `--hw-decode=off` |
+| H.264 双栈 | `h264_cuvid` / `h264_vaapi` | 同上 | `--codec h264` |
+
+跨端收发与 Windows `hevc_nvenc` 发送说明：**[`CROSS_ENDPOINT_HEVC.md`](CROSS_ENDPOINT_HEVC.md)**。
 
 运行时环境变量：
 
@@ -335,7 +354,9 @@ export XQC_VA_DEVICE=/dev/dri/renderD128
 | `Unknown encoder libx264` | 安装 `sudo apt install libx264-dev` 后重编 FFmpeg；或用系统 `ffmpeg` 生成 `.h264` |
 | 无 `h264_cuvid` | FFmpeg 未带 CUDA：重装 FFmpeg 且勿加 `--no-cuda`；或 WSL 无 GPU |
 | 无 `h264_vaapi` | 安装 `libva-dev` / `mesa-va-drivers`；检查 `/dev/dri` |
-| `[egl] ... missing` | 需 `DISPLAY` + `XQC_ENABLE_HW_DECODE=ON` 构建；GLFW 使用 EGL 上下文 |
+| `[egl] ... missing` | 仅 VAAPI 路径需要 EGL；NVIDIA 用 `cuda` + GLX PBO |
+| `--display failed` | `export DISPLAY=:0`；NVIDIA WSL 用 `--hw-decode=cuda`（勿强 EGL） |
+| VAAPI 失败 | WSL+NVIDIA 正常；用 `XQC_HW_DECODE=cuda` |
 | VAAPI 失败自动软解 | 日志 `[hw] using software`；检查驱动与 `XQC_VA_DEVICE` |
 | E2E `wire_pts->display` 异常大 | 旧版未锚定 sender PTS；用当前代码 + `--no-eos-file-decode` |
 

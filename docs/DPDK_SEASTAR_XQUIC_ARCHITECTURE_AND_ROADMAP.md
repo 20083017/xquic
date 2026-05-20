@@ -96,15 +96,17 @@ flowchart TB
 ### 2.7 硬件解码 + EGL 零拷贝（Linux，4K 压测）
 
 **操作手册（WSL 编 FFmpeg + cmake + 测试全流程）**：见 **[`WSL_FFMPEG_HW_BUILD_AND_TEST.md`](WSL_FFMPEG_HW_BUILD_AND_TEST.md)**。
+**跨端 HEVC 收发 + 收端显示**：[`CROSS_ENDPOINT_HEVC.md`](CROSS_ENDPOINT_HEVC.md)。
+**CUDA / VAAPI 本地 E2E 拆分**：[`WSL_HW_DECODE_TEST_MATRIX.md`](WSL_HW_DECODE_TEST_MATRIX.md)。
 
 构建要点：自编译 FFmpeg → 设置 `PKG_CONFIG_PATH` / `LD_LIBRARY_PATH` → `XQC_ENABLE_HW_DECODE=ON`。
 脚本：[`scripts/build_ffmpeg_hw_linux.sh`](../scripts/build_ffmpeg_hw_linux.sh)；E2E：[`scripts/wsl_video_e2e.sh`](../scripts/wsl_video_e2e.sh)。
 
-| 后端 | 解码 | 显示 | 启用方式 |
-|------|------|------|----------|
-| **VAAPI** | GPU (`hevc_vaapi` / `h264_vaapi`) | **dma-buf → EGLImage**（零拷贝） | `--codec hevc` + `--hw-decode=vaapi` |
-| **CUDA/NVDEC** | GPU (`hevc_cuvid` / `h264_cuvid`) | CPU NV12 → PBO | `--codec hevc` + `--hw-decode=cuda` |
-| **software** | CPU H.265/H.264 双栈 | PBO | `--hw-decode=off`；`--codec h264` 保留 H.264 |
+| GPU | 解码 | 显示（推荐） | 启用 |
+|-----|------|--------------|------|
+| **Intel/AMD** | VAAPI (`hevc_vaapi`) | **VAAPI + EGL + DMA-BUF** | `--hw-decode=vaapi` |
+| **NVIDIA** | CUDA/NVDEC (`hevc_cuvid`) | **CUDA/NVDEC + GLX + PBO** | `--hw-decode=cuda` |
+| 软件 | CPU H.265/H.264 | PBO | `--hw-decode=off` |
 
 **远端 4K 压测（另一台电脑发流）**：
 

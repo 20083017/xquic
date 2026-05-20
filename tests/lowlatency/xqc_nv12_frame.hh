@@ -10,12 +10,14 @@
 /**
  * How pixel memory is carried from decode thread to the GL display thread.
  *
- * - **Cpu**: packed NV12 in `data` (software decode or CUDA hwdownload).
+ * - **Cpu**: packed NV12 in `data` (software decode).
  * - **VaapiDmaBuf**: DRM PRIME fd exported from VAAPI; GL imports via EGLImage (zero-copy).
+ * - **CudaGl**: ref'd AV_PIX_FMT_CUDA AVFrame; GL display copies D2D via CUDA-GL interop.
  */
 enum class XqcNv12Backing : uint8_t {
     Cpu = 0,
     VaapiDmaBuf = 1,
+    CudaGl = 2,
 };
 
 /**
@@ -34,6 +36,9 @@ struct XqcNv12Frame {
     uint32_t dma_stride = 0;
     uint32_t dma_offset_y = 0;
     uint32_t dma_offset_uv = 0;
+
+    /** AVFrame* (AV_PIX_FMT_CUDA), ref held until display consumes (CudaGl only). */
+    void* cuda_frame = nullptr;
 
     int64_t pts_us = 0;
     uint64_t recv_us = 0;

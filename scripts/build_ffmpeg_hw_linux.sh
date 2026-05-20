@@ -7,6 +7,8 @@
 #   # NVIDIA (optional): CUDA toolkit matching your driver
 #   sudo apt install -y nvidia-cuda-toolkit   # or install from NVIDIA .run / cuda repo
 #
+# NVIDIA NVDEC (hevc_cuvid / h264_cuvid): nv-codec-headers are auto-installed when missing
+#   (local prefix: ~/local/nv-codec-headers by default; override with NV_CODEC_PREFIX).
 #   ./scripts/build_ffmpeg_hw_linux.sh --prefix "$HOME/ffmpeg-hw"
 #
 # Use your own FFmpeg tree (e.g. ~/ffmpeg or ~/FFmpeg) and apt CUDA under /usr:
@@ -36,6 +38,8 @@ ENABLE_X265=1
 ENABLE_PROGRAMS=1
 SHARED=1
 FFMPEG_SRC_OVERRIDE="${FFMPEG_SRC_OVERRIDE:-${FFMPEG_SRC:-}}"
+SKIP_NV_CODEC_HEADERS=0
+NV_CODEC_PREFIX="${NV_CODEC_PREFIX:-$HOME/local/nv-codec-headers}"
 
 usage() {
     cat <<'EOF'
@@ -48,6 +52,7 @@ Usage: build_ffmpeg_hw_linux.sh [options]
   --cuda-home PATH    Force CUDA root (default: auto: /usr/local/cuda or /usr)
   --jobs N            Parallel make jobs
   --no-cuda           Skip CUDA/NVDEC/NVENC (VAAPI-only build)
+  --skip-nv-codec-headers  Do not auto-install nv-codec-headers (CUDA may lack cuvid)
   --no-vaapi          Skip VAAPI
   --no-x264           Skip libx264 encoder (H.264 test clips)
   --no-x265           Skip libx265 encoder (HEVC test clips)
@@ -58,7 +63,9 @@ Usage: build_ffmpeg_hw_linux.sh [options]
 Environment:
   FFMPEG_SRC          Same as --ffmpeg-src (optional)
   CUDA_HOME           Optional hint (auto-detect prefers nvcc on PATH)
-  PKG_CONFIG_PATH     Prepended with $PREFIX/lib/pkgconfig on success
+  NV_CODEC_PREFIX     Install prefix for nv-codec-headers (default: ~/local/nv-codec-headers)
+  NV_CODEC_SRC        Clone dir for nv-codec-headers (default: build/ffmpeg-src/nv-codec-headers)
+  PKG_CONFIG_PATH     Prepended with nv-codec + FFmpeg pkgconfig on success
 
 Auto-detected source trees (when --ffmpeg-src omitted):
   ~/ffmpeg, ~/FFmpeg  (must contain configure)
@@ -83,6 +90,7 @@ while [[ $# -gt 0 ]]; do
         --cuda-home) CUDA_HOME="$2"; shift 2 ;;
         --jobs) JOBS="$2"; shift 2 ;;
         --no-cuda) ENABLE_CUDA=0; shift ;;
+        --skip-nv-codec-headers) SKIP_NV_CODEC_HEADERS=1; shift ;;
         --no-vaapi) ENABLE_VAAPI=0; shift ;;
         --no-x264) ENABLE_X264=0; shift ;;
         --no-x265) ENABLE_X265=0; shift ;;
@@ -142,8 +150,68 @@ detect_cuda_paths() {
             [[ -d "$d" ]] && CUDA_LIB_DIRS+=("$d")
         done
     fi
-    log "CUDA: lib dirs: ${CUDA_LIB_DIRS[*]:-<system default>}"
+    log "CUDA: lib dirs: ${CUDA_INC_DIRS[*]:-<system default>}"
     return 0
+}
+
+nv_codec_pkg_config_path() {
+    local prefix="$1"
+    echo "$prefix/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+}
+
+nv_codec_headers_usable() {
+    local prefix="$1"
+    [[ -f "$prefix/include/ffnvcodec/nvEncodeAPI.h" ]] || return 1
+    [[ -f "$prefix/lib/pkgconfig/ffnvcodec.pc" ]] || return 1
+    PKG_CONFIG_PATH="$(nv_codec_pkg_config_path "$prefix")" \
+        pkg-config --exists 'ffnvcodec >= 8.1.24.15' 2>/dev/null
+}
+
+export_nv_codec_pkg_config() {
+    export PKG_CONFIG_PATH="$(nv_codec_pkg_config_path "$NV_CODEC_PREFIX")"
+}
+
+ffnvcodec_modversion() {
+    PKG_CONFIG_PATH="$(nv_codec_pkg_config_path "$1")" \
+        pkg-config --modversion ffnvcodec 2>/dev/null || echo unknown
+}
+
+ensure_nv_codec_headers() {
+    local prefix src
+    prefix="$(mkdir -p "$NV_CODEC_PREFIX" && cd "$NV_CODEC_PREFIX" && pwd)"
+    NV_CODEC_PREFIX="$prefix"
+    src="${NV_CODEC_SRC:-$BUILD_ROOT/nv-codec-headers}"
+
+    if nv_codec_headers_usable "$NV_CODEC_PREFIX"; then
+        export_nv_codec_pkg_config
+        log "nv-codec-headers: OK (ffnvcodec $(ffnvcodec_modversion "$NV_CODEC_PREFIX") @ $NV_CODEC_PREFIX)"
+        return 0
+    fi
+
+    if [[ "$SKIP_NV_CODEC_HEADERS" -eq 1 ]]; then
+        log "nv-codec-headers: missing (--skip-nv-codec-headers; NVDEC may be unavailable)"
+        return 0
+    fi
+
+    mkdir -p "$(dirname "$src")"
+    if [[ ! -f "$src/Makefile" ]]; then
+        log "nv-codec-headers: cloning into $src"
+        git clone --depth 1 git@github.com:FFmpeg/nv-codec-headers.git "$src"
+    fi
+    [[ -f "$src/Makefile" ]] || die "nv-codec-headers source missing Makefile: $src"
+
+    if [[ -f "$NV_CODEC_PREFIX/include/ffnvcodec/nvEncodeAPI.h" ]]; then
+        log "nv-codec-headers: repairing install in $NV_CODEC_PREFIX"
+    else
+        log "nv-codec-headers: installing to $NV_CODEC_PREFIX"
+    fi
+    make -C "$src" install PREFIX="$NV_CODEC_PREFIX"
+
+    nv_codec_headers_usable "$NV_CODEC_PREFIX" || die \
+        "nv-codec-headers install failed (expected $NV_CODEC_PREFIX/lib/pkgconfig/ffnvcodec.pc)"
+
+    export_nv_codec_pkg_config
+    log "nv-codec-headers: ready (ffnvcodec $(ffnvcodec_modversion "$NV_CODEC_PREFIX"))"
 }
 
 if [[ "$ENABLE_CUDA" -eq 1 ]]; then
@@ -225,8 +293,33 @@ append_cuda_configure_flags() {
     for flag in cuvid nvdec nvenc; do
         if grep -qE "[[:space:]]--enable-${flag}[[:space:]]" <<<"$help"; then
             CONFIGURE+=(--enable-"$flag")
+            log "CUDA configure: --enable-$flag"
+        elif grep -qE "[[:space:]]--disable-${flag}[[:space:]]" <<<"$help"; then
+            log "CUDA configure: $flag autodetect (FFmpeg 6.x; requires ffnvcodec / nv-codec-headers)"
         else
-            log "CUDA: --enable-$flag not in this configure (skipped)"
+            log "CUDA configure: $flag not exposed by this FFmpeg configure script"
+        fi
+    done
+
+    CONFIGURE+=(
+        --enable-decoder=h264_cuvid
+        --enable-decoder=hevc_cuvid
+        --enable-bsf=h264_mp4toannexb
+        --enable-bsf=hevc_mp4toannexb
+    )
+    log "CUDA configure: h264_cuvid/hevc_cuvid + mp4toannexb bsfs"
+}
+
+verify_cuda_configure() {
+    local mak="ffbuild/config.mak"
+    [[ -f "$mak" ]] || die "missing $mak after ./configure"
+    local key
+    for key in CONFIG_FFNVCODEC CONFIG_CUVID CONFIG_NVDEC \
+        CONFIG_H264_CUVID_DECODER CONFIG_HEVC_CUVID_DECODER; do
+        if grep -q "^${key}=yes\$" "$mak"; then
+            log "configure OK: $key"
+        else
+            die "configure did not enable $key (PKG_CONFIG_PATH=${PKG_CONFIG_PATH:-<unset>}); see ffbuild/config.log"
         fi
     done
 }
@@ -299,13 +392,22 @@ if [[ "$ENABLE_VAAPI" -eq 1 ]]; then
 fi
 
 if [[ "$ENABLE_CUDA" -eq 1 ]]; then
+    ensure_nv_codec_headers
     append_cuda_configure_flags
+    export_nv_codec_pkg_config
+    log "PKG_CONFIG_PATH=$PKG_CONFIG_PATH"
     for inc in "${CUDA_INC_DIRS[@]}"; do
         EXTRA_CFLAGS+=( "-I$inc" )
     done
+    if [[ -d "$NV_CODEC_PREFIX/include" ]]; then
+        EXTRA_CFLAGS+=( "-I$NV_CODEC_PREFIX/include" )
+    fi
     for libd in "${CUDA_LIB_DIRS[@]}"; do
         EXTRA_LDFLAGS+=( "-L$libd" "-Wl,-rpath,$libd" )
     done
+    if [[ -d "$NV_CODEC_PREFIX/lib" ]]; then
+        EXTRA_LDFLAGS+=( "-L$NV_CODEC_PREFIX/lib" "-Wl,-rpath,$NV_CODEC_PREFIX/lib" )
+    fi
     log "CUDA: extra flags for nvcc=$NVCC_PATH"
 fi
 
@@ -320,6 +422,10 @@ log "configure: ${CONFIGURE[*]}"
     --extra-cflags="${EXTRA_CFLAGS[*]}" \
     --extra-ldflags="${EXTRA_LDFLAGS[*]}"
 
+if [[ "$ENABLE_CUDA" -eq 1 ]]; then
+    verify_cuda_configure
+fi
+
 log "building ($JOBS jobs)…"
 make -j"$JOBS"
 make install
@@ -328,19 +434,42 @@ export PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PAT
 
 verify_decoder() {
     local name="$1"
-    if pkg-config --exists libavcodec 2>/dev/null; then
-        if pkg-config --variable=libdir libavcodec | grep -q .; then
-            :
-        fi
+    local required="${2:-0}"
+    local cfg_key="CONFIG_$(echo "$name" | tr '[:lower:]' '[:upper:]')_DECODER"
+
+    if [[ -f ffbuild/config.mak ]] && grep -q "^${cfg_key}=yes\$" ffbuild/config.mak; then
+        log "decoder OK: $name (config.mak)"
+        return 0
     fi
+
     if [[ -x "$PREFIX/bin/ffmpeg" ]]; then
-        if "$PREFIX/bin/ffmpeg" -hide_banner -decoders 2>/dev/null | grep -q "$name"; then
+        if LD_LIBRARY_PATH="$PREFIX/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+            "$PREFIX/bin/ffmpeg" -hide_banner -decoders 2>/dev/null | grep -Fw "$name" >/dev/null; then
             log "decoder OK: $name"
             return 0
         fi
     fi
+    if [[ "$required" -eq 1 ]]; then
+        die "decoder MISSING (required for CUDA/NVDEC): $name — check nv-codec-headers and re-run configure"
+    fi
     log "decoder MISSING (optional): $name"
     return 1
+}
+
+verify_hwaccel() {
+    local name="$1"
+    if [[ -f ffbuild/config.mak ]] && grep -q "^CONFIG_CUDA=yes\$" ffbuild/config.mak; then
+        log "hwaccel OK: $name (config.mak CONFIG_CUDA)"
+        return 0
+    fi
+    if [[ -x "$PREFIX/bin/ffmpeg" ]]; then
+        if LD_LIBRARY_PATH="$PREFIX/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+            "$PREFIX/bin/ffmpeg" -hide_banner -hwaccels 2>/dev/null | grep -Fw "$name" >/dev/null; then
+            log "hwaccel OK: $name"
+            return 0
+        fi
+    fi
+    die "hwaccel MISSING (required for CUDA/NVDEC): $name"
 }
 
 log "install complete: $PREFIX"
@@ -348,8 +477,11 @@ log "export PKG_CONFIG_PATH=$PKG_CONFIG_PATH"
 
 [[ "$ENABLE_VAAPI" -eq 1 ]] && verify_decoder h264_vaapi || true
 [[ "$ENABLE_VAAPI" -eq 1 ]] && verify_decoder hevc_vaapi || true
-[[ "$ENABLE_CUDA" -eq 1 ]] && verify_decoder h264_cuvid || true
-[[ "$ENABLE_CUDA" -eq 1 ]] && verify_decoder hevc_cuvid || true
+if [[ "$ENABLE_CUDA" -eq 1 ]]; then
+    verify_hwaccel cuda
+    verify_decoder h264_cuvid 1
+    verify_decoder hevc_cuvid 1
+fi
 
 if [[ "$ENABLE_PROGRAMS" -eq 1 ]]; then
     if [[ "$ENABLE_X264" -eq 1 ]] && [[ -x "$PREFIX/bin/ffmpeg" ]] \

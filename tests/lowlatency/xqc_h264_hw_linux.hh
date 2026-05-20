@@ -2,9 +2,8 @@
  * @file xqc_h264_hw_linux.hh
  * @brief Linux hardware H.264 decode (VAAPI / CUDA-NVDEC) for the stream decoder.
  *
- * **VAAPI** (Intel/AMD): decode on GPU → export DRM PRIME dma-buf → EGLImage (zero-copy GL).
- * **CUDA** (NVIDIA): NVDEC via `h264_cuvid` / `hevc_cuvid` → CPU NV12 (hw decode,
- *   display still uses PBO until CUDA-EGL interop is added).
+ * **Intel/AMD (best)**: VAAPI → **EGL + DMA-BUF** (zero-copy display).
+ * **NVIDIA**: CUDA/NVDEC (`h264_cuvid` / `hevc_cuvid`) → CUDA-GL interop (no hwdownload).
  *
  * Env:
  *   XQC_HW_DECODE=auto|vaapi|cuda|off
@@ -36,6 +35,12 @@ void xqc_h264_hw_configure(const char* mode_override);
 XqcHwDecodeBackend xqc_h264_hw_init();
 
 XqcHwDecodeBackend xqc_h264_hw_active_backend();
+
+/** VAAPI → EGL dma-buf display; CUDA → CUDA-GL interop; software → GLX + CPU PBO upload. */
+bool xqc_h264_hw_display_use_egl();
+
+/** True when CUDA NVDEC uses CUDA-GL interop display (not CPU PBO). */
+bool xqc_h264_hw_display_use_cuda_gl();
 
 /** Human-readable label for logs (e.g. "vaapi+egl", "cuda+pbo"). */
 const char* xqc_h264_hw_backend_name();
