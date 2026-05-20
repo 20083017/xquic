@@ -1,0 +1,13 @@
+{
+  "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg-tool/main/docs/vcpkg.schema.json",
+  "name": "xquic-lowlatency-tools",
+  "version-string": "0.0.1",
+  "description": "Optional FFmpeg (NVDEC-friendly) for xqc_nvdec_xquic_viewer — enable with -DCMAKE_TOOLCHAIN_FILE=[vcpkg]/scripts/buildsystems/vcpkg.cmake",
+  "dependencies": [
+    {
+      "name": "ffmpeg",
+      "default-features": false,
+      "features": ["nvcodec"]
+    }
+  ]
+}
